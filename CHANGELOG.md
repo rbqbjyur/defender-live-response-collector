@@ -4,6 +4,29 @@ Notable changes to `collector.ps1`. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 1.5.0 - 2026-10-22
+
+### Added
+- The SHA-256 of the zip, or of each volume, is printed under its `getfile`
+  lines and kept in the run log, in `sha256sum` format.
+- Copies whose size differs from the source's size when opened are named under
+  the summary, with the bytes copied.
+
+### Fixed
+- A folder that exists but can't be listed was counted as Missing; it now
+  counts as Not accessible, is warned about and is named under the summary.
+- A copy that failed part-way stayed in the zip, incomplete, with nothing to
+  say which entry; it is now warned about and named under the summary.
+- A file whose name ends with a dot or a space was opened as its namesake
+  without them (e.g. `report.` as `report`), so its entry held another file's
+  content; every file is now opened through `\\?\`.
+- Files in a folder whose name ends with a dot or a space (e.g. `dir.`) were
+  silently left out: PowerShell listed the folder without them instead. Such
+  folders are now listed through `\\?\`.
+- Windows' compatibility links that deny listing (`Default User`, `All Users`,
+  `Documents and Settings`) weren't recognised as links, so files under
+  `Default User` were collected twice; they are no longer followed.
+
 ## 1.4.0 - 2026-10-13
 
 ### Added

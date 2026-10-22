@@ -1,10 +1,10 @@
-# Defender Live Response Collector
+# defender-live-response-collector
 
 A single, self-contained PowerShell script for forensic triage collection
 (incident response / DFIR) through **Microsoft Defender for Endpoint (MDE)
 Live Response**. Upload it to the Live Response library, run it on a Windows
-device, and pull back one zip (split into 1 GiB volumes when larger) of
-timeline-relevant forensic artefacts (artifacts) - no binaries to upload.
+device, and pull back one zip of timeline-relevant forensic artefacts
+(artifacts), with its SHA-256 - no binaries to upload.
 
 **The problem it solves:**
 
@@ -29,109 +29,127 @@ timeline-relevant forensic artefacts (artifacts) - no binaries to upload.
 It is a **lightweight, best-effort first pass**, for when all you have is a
 Live Response session. It uses ordinary file reads only, with **no raw disk
 access (no NTFS parser) and no Volume Shadow Copy**. It copies what Windows lets
-it open and moves on, so locked files and NTFS metafiles are not in the zip
-(see [What it can't collect](#what-it-cant-collect)).
+it open, says exactly what it couldn't, and moves on. For a comprehensive
+collection, including locked files and raw NTFS artefacts, use a full
+collector such as KAPE or the Velociraptor Offline Collector.
 
-For a comprehensive collection, including locked files and raw NTFS
-artefacts, use a full collector such as KAPE or the Velociraptor Offline
-Collector.
+<table>
+  <tr>
+    <td><img src="docs/images/end-of-run.webp" alt="Console: the end of a run - the Warnings section, the artefact summary with a status and, where a gap is normal for the host, its reason for each of the 31 artefacts, the folders that could not be listed, the number of files collected, the getfile command for the zip, its SHA-256, the getfile command for the run log, and getfile commands for the locked files the Defender sensor can fetch ($MFT, the system hives, the logged-on user's hives)"></td>
+    <td><img src="docs/images/run-log.webp" alt="Notepad: the run log beside the zip - the banner with the collector's version, the host and the UTC start time, the OS and the drives searched, the Warnings section and the 31 progress lines, one per artefact"></td>
+  </tr>
+  <tr>
+    <td><img src="docs/images/zip-layout.webp" alt="Explorer: the zip's top level, one folder per drive searched (C, and E for a second drive's Recycle Bin)"></td>
+    <td><img src="docs/images/zip-layout-c.webp" alt="Explorer: inside the zip's C folder, the original paths: $Recycle.Bin, ProgramData, Users and Windows"></td>
+  </tr>
+</table>
 
-## Approach
+A run as an administrator on a test machine (Live Response runs it as SYSTEM,
+so its warning that the run isn't SYSTEM doesn't appear there).
 
-A focused, timeline-oriented triage set rather than a full sweep:
+## Table of contents
 
+- [What it does](#what-it-does)
+- [Install](#install)
+- [Usage](#usage)
+- [What it collects](#what-it-collects)
+- [What it can't collect](#what-it-cant-collect)
+- [How it works](#how-it-works)
+- [Reading the summary](#reading-the-summary)
+- [What the output shows](#what-the-output-shows)
+- [What it does not do](#what-it-does-not-do)
+- [Contributing](#contributing)
+- [Licence](#licence)
+
+## What it does
+
+- **Collects 28 timeline-relevant artefacts** in one run, and lists `$MFT`
+  for `getfile` (31 summary lines with the other two NTFS metafiles): event
+  logs, Prefetch, Amcache and PCA, registry hives, SRUM, BITS, scheduled tasks,
+  LNK files and JumpLists, browser history for every maintained browser,
+  Recycle Bin `$I` records, PowerShell history and transcripts, Defender,
+  OneDrive, Teams and Configuration Manager logs, and more
+  ([What it collects](#what-it-collects)).
 - **Timeline value first.** Artefacts are chosen for timestamped evidence of
   execution, file access, persistence, device use, browsing and command-line
-  activity.
-- **Windows-native sources.** Third-party application artefacts are out of
-  scope; browser history is the exception. Microsoft client logs and metadata
-  (Defender, Configuration Manager, OneDrive, Teams) are included.
-- **Metadata over content.** E.g. `$I` records rather than the deleted `$R`
-  files, `.wer` reports rather than memory dumps, browser history rather than
-  caches, keeping the zip practical to pull over Live Response.
+  activity. Windows-native sources only, plus browser history; metadata over
+  content (`$I` records, not the deleted `$R` files; `.wer` reports, not memory
+  dumps; browser history, not caches).
 - **Legacy forms included.** Older-Windows forms of each artefact (e.g. `.evt`,
   `RecentFileCache.bcf`, XP profile paths) and the previous install kept in
-  `Windows.old` after a feature update are collected as part of the same
-  artefact, after its current form.
+  `Windows.old` are collected as part of the same artefact.
+- **Every local drive** for per-volume artefacts (Recycle Bin, and `$MFT` for
+  `getfile`): fixed or removable, NTFS, FAT or exFAT.
+- **SHA-256 of the zip** (or of each volume), printed under its `getfile`
+  lines in `sha256sum` format, so the download can be checked.
+- **Says what it couldn't collect, and why.** One Warnings section, a summary
+  line per artefact with the reason where a gap is normal for the host, the
+  folders it couldn't list and the copies that changed or failed part-way, and
+  ready-to-paste `getfile` commands for locked files the Defender sensor can
+  fetch.
+- **A run log** beside the zip, with everything the console showed.
+- **Split volumes** for a zip over 1 GiB, so each `getfile` stays well within
+  Live Response's limits.
+- **Nothing but Windows PowerShell 5.1:** no modules, no downloads, no child
+  processes.
 
-Everything is collected raw, for processing with your usual parsers and
-timeline tooling.
+## Install
 
-## Behaviour
+```powershell
+# Download collector.ps1 from the latest release, then check it against the
+# SHA-256 in the release notes:
+Get-FileHash .\collector.ps1 -Algorithm SHA256
+```
 
-- **Requirements:** Windows PowerShell 5.1.
-- **Best effort.** Anything that can't be read is skipped and counted in the
-  summary; the run never stops on an error, except when the output can't be
-  completed (a full system drive, or a split that fails part-way): it then
-  deletes the partial output and asks you to run it again.
-- **Warnings.** Anything worth a closer look is listed in one Warnings
-  section: shown at the start if known by then, and again before the summary
-  (or "Warnings: none"). It covers unusual gaps (artefacts that should exist
-  on this host but are missing, and unexplained locks), not running as
-  SYSTEM, a fallback output folder, a zip that couldn't be split into
-  volumes, a file over `getfile`'s 3 GB limit, and a full disk.
-- **Locked files.** Files are opened with shared read access, so in-use files
-  are copied where Windows allows it. Files held exclusively are skipped (see
-  [What it can't collect](#what-it-cant-collect)).
-- **Single pass.** Files are streamed straight into the zip
-  (`System.IO.Compression`, fastest compression) with no temporary copies.
-  Zip entry times are each file's last-write time in UTC.
-- **Split volumes.** A zip over 1 GiB is split in place at the end into
-  standard split volumes, `<name>.zip.001`, `.002`, ... (a byte split of the
-  one zip, all but the last exactly 1 GiB): open `.001` in 7-Zip or
-  concatenate them. Splitting needs free space for one volume, not a second
-  copy. A zip up to 1 GiB stays a single `.zip`.
-- **Output location.** A `Collections` folder under the Defender for Endpoint
-  sensor's own Temp folder,
-  `%SystemDrive%\ProgramData\Microsoft\Windows Defender Advanced Threat Protection\Temp\Collections\`,
-  where Live Response also keeps its script transcripts. If that can't be
-  written, it falls back to a `LiveResponseCollector` folder in
-  `%SystemDrive%\Windows\SystemTemp\` (newer Windows; SYSTEM and Administrators
-  only), then in the running account's temp folder (`C:\Windows\Temp\` for
-  SYSTEM). Only the collector's own folder is created; a location whose parent
-  folder doesn't exist is skipped. Each run adds a new
-  `<HOSTNAME>_<UTC timestamp>Z.zip` (or its volumes) and a `.log` of the same
-  name with the run's console output. The collector doesn't delete its output.
-- **Footprint.** Writes the output folder, the zip (or its volumes) and its
-  log; nothing is downloaded or installed, and no child processes are
-  started.
-- **Live Response limits.** `getfile` retrieves up to 3 GB per file, and slow
-  links can time out first; `run` commands time out after 30 minutes. Split
-  volumes keep each `getfile` well within its size and time limits; the
-  script doesn't stop itself early, so a `run` over 30 minutes times out.
-  `getfile` may deliver a file gzip-wrapped (`.gz`); the zip inside is
-  unchanged.
+Latest release: https://github.com/rbqbjyur/defender-live-response-collector/releases/latest
 
-## Quick start
-
-1. Download `collector.ps1` from the
-   [latest release](https://github.com/rbqbjyur/defender-live-response-collector/releases/latest),
-   check its SHA-256 against the release notes, and upload it to the Live
-   Response library in the Defender portal.
-2. Open a Live Response session on the device and run:
-   ```
-   run collector.ps1
-   ```
-3. When it finishes, it prints `getfile` commands for the zip (one per volume
-   if it was split) and for the run log (the console output):
-   ```
-   getfile "C:\ProgramData\Microsoft\Windows Defender Advanced Threat Protection\Temp\Collections\<HOSTNAME>_<yyyyMMdd_HHmmss>Z.zip"
-   getfile "C:\ProgramData\Microsoft\Windows Defender Advanced Threat Protection\Temp\Collections\<HOSTNAME>_<yyyyMMdd_HHmmss>Z.log"
-   ```
-4. If it lists **Additional inaccessible artefacts**, those are files PowerShell
-   could not open (e.g. `$MFT`, locked hives). Copy and paste the
-   printed `getfile` lines into the same session to retrieve them directly via
-   the Defender sensor.
-
-The script is unsigned. Either enable *Allow unsigned script execution* in the
+Upload `collector.ps1` to the Live Response library in the Defender portal.
+The script is unsigned: either enable *Allow unsigned script execution* in the
 Live Response settings for your tenant, or sign it with your own code-signing
 certificate.
+
+### Requirements
+
+- Windows PowerShell 5.1 on the device.
+- Microsoft Defender for Endpoint Live Response, which runs the script as
+  SYSTEM. Run any other way, files only SYSTEM can read are counted as not
+  accessible, and the run says so in its Warnings.
+- Free space on the system drive for the zip (and one volume more when it is
+  split).
+
+## Usage
+
+```
+run collector.ps1
+```
+
+No parameters. When it finishes, it prints the commands to retrieve its
+output in the same session:
+
+```
+Retrieve the zip with:
+getfile "C:\ProgramData\Microsoft\Windows Defender Advanced Threat Protection\Temp\Collections\<HOSTNAME>_<yyyyMMdd_HHmmss>Z.zip"
+SHA-256 of the zip:
+<sha-256>  <HOSTNAME>_<yyyyMMdd_HHmmss>Z.zip
+Retrieve the run log with:
+getfile "C:\ProgramData\Microsoft\Windows Defender Advanced Threat Protection\Temp\Collections\<HOSTNAME>_<yyyyMMdd_HHmmss>Z.log"
+```
+
+- A zip over 1 GiB comes as `.zip.001`, `.zip.002`, ... with one `getfile`
+  line and one SHA-256 line each: open `.001` in 7-Zip or concatenate them.
+- `getfile` may deliver a file gzip-wrapped (`.gz`); the zip inside is
+  unchanged, and the SHA-256 is the zip's.
+- If it lists **Additional inaccessible artefacts**, those are files
+  PowerShell could not open (e.g. `$MFT`, locked hives): paste the printed
+  `getfile` lines into the same session to retrieve them through the Defender
+  sensor.
 
 ## What it collects
 
 These are the locations it attempts, in the order the script runs them (the
 NTFS metafiles that open the summary are covered under
-[What it can't collect](#what-it-cant-collect)). Anything locked is skipped.
+[What it can't collect](#what-it-cant-collect)). Anything locked is skipped
+and counted.
 
 - `<user>` is every folder under `C:\Users` (and, on XP-era layouts,
   `C:\Documents and Settings`).
@@ -141,14 +159,17 @@ NTFS metafiles that open the summary are covered under
 - `<profile>` is any browser profile folder.
 - Within each artefact, locations run from current Windows to legacy forms and
   then `Windows.old`.
-- Junctions and symbolic links are not followed; on Windows they only point
-  back to folders already covered.
+- Junctions and symbolic links are not followed, including Windows' own
+  compatibility links (`Default User`, `All Users`, `Documents and Settings`);
+  they only point back to folders already covered.
 - Paths are resolved from `%SystemDrive%`, so non-`C:` installs work too.
 - Per-volume artefacts (Recycle Bin, and the NTFS metafiles under
   [What it can't collect](#what-it-cant-collect)) are taken from every local
   drive, fixed or removable (NTFS, FAT or exFAT), e.g. `C:`, `D:` and a USB
   drive; network drives are not.
-- Inside the zip, files keep their original path (e.g. `C/Windows/Prefetch/...`).
+- Inside the zip, files keep their original path
+  (e.g. `C/Windows/Prefetch/...`), including names that end with a dot or a
+  space.
 
 | Artefact | Location |
 |---|---|
@@ -208,79 +229,64 @@ running browser's History), are collected normally. If any other
 machine-wide file turns out to be locked, it is added to the printed `getfile`
 list (transaction logs excepted).
 
-## Example output
+## How it works
 
-A Live Response run on a workstation; counts depend on the host.
+- **Best effort.** Anything that can't be read is skipped and counted in the
+  summary; the run never stops on an error, except when the output can't be
+  completed (a full system drive, or a split that fails part-way): it then
+  deletes the partial output and asks you to run it again.
+- **Warnings.** Anything worth a closer look is listed in one Warnings
+  section: shown at the start if known by then, and again before the summary
+  (or "Warnings: none"). It covers unusual gaps (artefacts that should exist
+  on this host but are missing, and unexplained locks), not running as
+  SYSTEM, a fallback output folder, folders that couldn't be listed, copies
+  that failed part-way, a zip that couldn't be split into volumes, a file over
+  `getfile`'s 3 GB limit, a SHA-256 that couldn't be calculated, and a full
+  disk.
+- **Fail closed.** A folder that exists but can't be listed counts as *Not
+  accessible*, never *Missing*, and is named under the summary. A copy that
+  fails part-way stays in the zip, incomplete (a zip can't drop an entry once
+  written), and is named under the summary with the bytes copied; so is a
+  live file whose size changed while it was copied.
+- **Locked files.** Files are opened with shared read access, so in-use files
+  are copied where Windows allows it. Files held exclusively are skipped (see
+  [What it can't collect](#what-it-cant-collect)).
+- **Names as they are.** Every file is opened through an extended-length path
+  (`\\?\`), so names Windows would otherwise alter (a trailing dot or space,
+  `nul`, paths over 260 characters) are read as the file they name.
+- **Single pass.** Files are streamed straight into the zip
+  (`System.IO.Compression`, fastest compression) with no temporary copies.
+  Zip entry times are each file's last-write time in UTC.
+- **Split volumes.** A zip over 1 GiB is split in place at the end into
+  standard split volumes, `<name>.zip.001`, `.002`, ... (a byte split of the
+  one zip, all but the last exactly 1 GiB). Splitting needs free space for one
+  volume, not a second copy. A zip up to 1 GiB stays a single `.zip`.
+- **Output location.** A `Collections` folder under the Defender for Endpoint
+  sensor's own Temp folder,
+  `%SystemDrive%\ProgramData\Microsoft\Windows Defender Advanced Threat Protection\Temp\Collections\`,
+  where Live Response also keeps its script transcripts. If that can't be
+  written, it falls back to a `LiveResponseCollector` folder in
+  `%SystemDrive%\Windows\SystemTemp\` (newer Windows; SYSTEM and Administrators
+  only), then in the running account's temp folder (`C:\Windows\Temp\` for
+  SYSTEM). Only the collector's own folder is created; a location whose parent
+  folder doesn't exist is skipped. Each run adds a new
+  `<HOSTNAME>_<UTC timestamp>Z.zip` (or its volumes) and a `.log` of the same
+  name with the run's console output. The collector doesn't delete its output.
+- **Footprint.** Writes the output folder, the zip (or its volumes) and its
+  log; nothing is downloaded or installed, and no child processes are
+  started.
+- **Live Response limits.** `getfile` retrieves up to 3 GB per file, and slow
+  links can time out first; `run` commands time out after 30 minutes. Split
+  volumes keep each `getfile` well within its size and time limits; the
+  script doesn't stop itself early, so a `run` over 30 minutes times out.
 
-```
-C:\> run collector.ps1
-Transcript started, output file is C:\ProgramData\Microsoft\Windows Defender Advanced Threat Protection\Temp\PSScriptOutputs\PSScript_Transcript_{00000000-0000-0000-0000-000000000000}.txt
+## Reading the summary
 
-Live Response collector v1.4.0
+- **N collected:** copied into the zip.
+- **Not accessible:** the file (or a folder holding it) exists but could not
+  be read.
+- **Missing:** not present on this host.
 
-Host WS042, started 2026-10-13T11:08:13Z
-OS Microsoft Windows 11 Enterprise 24H2
-Drives C: (NTFS)
-
-[01/31] Collecting $LogFile
-[02/31] Collecting $MFT
-[03/31] Collecting $UsnJrnl:$J
-...
-[31/31] Collecting Windows Timeline
-
-Warnings: none
-
-Artefact summary:
-  $LogFile                  Not accessible                  (requires NTFS parser)
-  $MFT                      Not accessible                  (requires NTFS parser)
-  $UsnJrnl:$J               Not accessible                  (requires NTFS parser)
-  Application Compatibility 6 collected
-  BITS                      10 collected
-  Defender Logs             30 collected
-  Event Logs                437 collected
-  Firewall Log              Missing                         (off by default)
-  Group Policy              Missing                         (not joined to on-premises AD)
-  Prefetch                  288 collected
-  Registry Hives (system)   Not accessible                  (requires NTFS parser)
-  Restore Point Logs        Missing                         (not on this Windows version)
-  SCCM Client Logs          Missing
-  Scheduled Tasks           316 collected
-  SetupAPI                  12 collected
-  SRUM                      18 collected
-  User Access Logging (SUM) Missing                         (Windows Server only)
-  Browser History           9 collected, 1 not accessible   (requires NTFS parser)
-  File History Catalogs     Missing                         (off by default)
-  JumpLists                 48 collected
-  LNK                       70 collected
-  .NET CLR Usage Logs       2 collected
-  OneDrive Metadata         3814 collected
-  PowerShell History        1 collected
-  PowerShell Transcripts    Missing
-  Recycle Bin               6 collected
-  Registry Hives (user)     27 collected, 15 not accessible (requires NTFS parser)
-  Startup Folders           3 collected
-  Teams Logs                46 collected
-  WER                       524 collected
-  Windows Timeline          9 collected
-
-Collected 5704 files total (228.66 MB)
-Retrieve the zip with:
-getfile "C:\ProgramData\Microsoft\Windows Defender Advanced Threat Protection\Temp\Collections\WS042_20261013_110813Z.zip"
-Retrieve the run log with:
-getfile "C:\ProgramData\Microsoft\Windows Defender Advanced Threat Protection\Temp\Collections\WS042_20261013_110813Z.log"
-
-Additional inaccessible artefacts (locked from PowerShell - retrieve directly in this Live Response session):
-getfile "C:\$MFT"
-getfile "C:\Windows\System32\config\SAM"
-getfile "C:\Windows\System32\config\SECURITY"
-getfile "C:\Windows\System32\config\SOFTWARE"
-getfile "C:\Windows\System32\config\SYSTEM"
-getfile "C:\Users\user01\NTUSER.DAT"
-getfile "C:\Users\user01\AppData\Local\Microsoft\Windows\UsrClass.dat"
-```
-
-Status meanings: **N collected** (copied into the zip), **Not accessible** (the
-file exists but could not be read), **Missing** (not present on this host).
 A note in its own column explains a gap that is normal for this host: for
 Missing, the reason (e.g. "normal for Windows Server" for Prefetch, "not on
 this Windows version" for legacy-only artefacts); for files that are normally
@@ -288,12 +294,64 @@ locked, **(requires NTFS parser)** (see
 [What it can't collect](#what-it-cant-collect)). A Missing status without a note
 is listed under Warnings only if the artefact should exist on this host (e.g.
 event logs, or Prefetch on a workstation); many artefacts may simply be absent
-(e.g. PowerShell transcripts) and are not warned about.
+(e.g. PowerShell transcripts) and are not warned about. A folder that couldn't
+be listed, or a copy that failed part-way, always puts its artefact under
+Warnings, whatever its note.
+
 Browser History counts browser profiles, not files; a profile counts as
 collected only if its history database was read (a locked database with
 readable journal or logs is *Not accessible*).
 
+## What the output shows
+
+- The zip holds the files as they were read during the run, at that point in
+  time, under their original paths. The SHA-256 printed with it identifies
+  that zip: a downloaded copy with the same SHA-256 is the zip the script
+  wrote, and a file extracted from it can be shown to come from that zip.
+- The run log and the console say what was collected, what wasn't and why, on
+  which host, under which Windows version, from which drives, and when (UTC),
+  with the script's version.
+- Each zip entry's time is the file's last-write time in UTC. Creation and
+  access times are not kept.
+- A file that was being written to while it was copied is in the zip as it was
+  read, and is named under the summary when its size changed.
+- The run says nothing about the source after it ended: the device is live,
+  and the same files will not hash the same later.
+- The SHA-256 is printed by the script on the device; it shows the download
+  arrived intact, not that the device itself was trustworthy.
+
+## What it does not do
+
+- No raw disk access, NTFS parsing or Volume Shadow Copy: locked files and
+  NTFS metafiles come through `getfile` or a full collector
+  ([What it can't collect](#what-it-cant-collect)).
+- No chain of custody after collection: no sealed records, no history of
+  copies.
+- No per-file hashes: the sources are live, so they couldn't be checked again
+  later; the zip's SHA-256 fixes what was collected.
+- No third-party application artefacts beyond browser history, and no browser
+  data beyond history (no cookies, caches or saved passwords).
+- No cleanup: the output stays in its folder until you remove it.
+- No time-limit handling: a run that reaches Live Response's 30-minute limit
+  is cut off by Live Response.
+
+## Contributing
+
+Questions and bug reports are welcome as GitHub issues, and pull requests are
+welcome.
+
+- **Adding an artefact** is a row in the `$artefacts` table in `collector.ps1`
+  (its fields are documented above the table) and a row in this README's
+  table; a legacy form of an existing artefact is another path pattern in its
+  row, after the current one.
+- **Conventions:** Windows PowerShell 5.1 only, no modules, no child
+  processes or `Add-Type`; PSScriptAnalyzer-clean; times in UTC; British
+  spelling in output and documentation. Every failure is isolated to its own
+  location and reported, never silent.
+- Changes are listed in [CHANGELOG.md](CHANGELOG.md).
+
 ## Licence
 
-[0BSD](LICENSE) (Zero-Clause BSD): use it for anything, no attribution
-required. Provided as is, with no warranty.
+[0BSD](LICENSE) (Zero-Clause BSD). Copyright (C) 2026 by outis.
+Use it for anything, with no attribution required; provided as is, with no
+warranty.
