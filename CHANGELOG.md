@@ -4,6 +4,29 @@ Notable changes to `collector.ps1`. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 2.0.0 - 2026-10-22
+
+The zip's layout changes: `collection.csv` joins the drive folders at its
+root, and empty files and file symbolic links are no longer in it.
+
+### Added
+- `collection.csv` at the zip's root: one row per file collected or found but
+  not readable - artefact, outcome, source path, zip entry, size, bytes
+  copied, SHA-256 of the bytes written, the file's own created, modified and
+  accessed times (UTC), and the error for a failure - and one per folder that
+  couldn't be listed, with the reason.
+
+### Changed
+- Empty (0-byte) files are left out of the zip, the record and every count.
+- File symbolic links are not followed, and are left out of the zip, the
+  record and every count.
+- The printed `getfile` commands leave out only registry transaction logs
+  (`.LOG1`/`.LOG2`); other locked files, ESE logs included, are listed.
+- "Unusual gaps" lists one artefact per line.
+- Code restructured for readability: full-word names, results returned
+  instead of script state, no script-wide error suppression. No change to
+  what is collected beyond the lines above.
+
 ## 1.5.0 - 2026-10-22
 
 ### Added

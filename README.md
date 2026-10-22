@@ -39,7 +39,7 @@ collector such as KAPE or the Velociraptor Offline Collector.
     <td><img src="docs/images/run-log.webp" alt="Notepad: the run log beside the zip - the banner with the collector's version, the host and the UTC start time, the OS and the drives searched, the Warnings section and the 31 progress lines, one per artefact"></td>
   </tr>
   <tr>
-    <td><img src="docs/images/zip-layout.webp" alt="Explorer: the zip's top level, one folder per drive searched (C, and E for a second drive's Recycle Bin)"></td>
+    <td><img src="docs/images/zip-layout.webp" alt="Explorer: the zip's top level: collection.csv, the per-file record, beside one folder per drive searched (C, and F for a second drive's Recycle Bin)"></td>
     <td><img src="docs/images/zip-layout-c.webp" alt="Explorer: inside the zip's C folder, the original paths: $Recycle.Bin, ProgramData, Users and Windows"></td>
   </tr>
 </table>
@@ -78,10 +78,14 @@ so its warning that the run isn't SYSTEM doesn't appear there).
 - **Legacy forms included.** Older-Windows forms of each artefact (e.g. `.evt`,
   `RecentFileCache.bcf`, XP profile paths) and the previous install kept in
   `Windows.old` are collected as part of the same artefact.
-- **Every local drive** for per-volume artefacts (Recycle Bin, and `$MFT` for
+- **Every local drive** for per-drive artefacts (Recycle Bin, and `$MFT` for
   `getfile`): fixed or removable, NTFS, FAT or exFAT.
 - **SHA-256 of the zip** (or of each volume), printed under its `getfile`
   lines in `sha256sum` format, so the download can be checked.
+- **A per-file record**, `collection.csv` at the zip's root: one row per file
+  attempted, with its outcome, size, bytes copied, the SHA-256 of the bytes in
+  the zip, and its created, modified and accessed times (UTC), and one per
+  folder that couldn't be listed.
 - **Says what it couldn't collect, and why.** One Warnings section, a summary
   line per artefact with the reason where a gap is normal for the host, the
   folders it couldn't list and the copies that changed or failed part-way, and
@@ -143,6 +147,11 @@ getfile "C:\ProgramData\Microsoft\Windows Defender Advanced Threat Protection\Te
   PowerShell could not open (e.g. `$MFT`, locked hives): paste the printed
   `getfile` lines into the same session to retrieve them through the Defender
   sensor.
+- `collection.csv`, at the zip's root, is the per-file record: every file
+  collected or found but not readable, with its outcome (`collected`,
+  `size changed`, `incomplete`, `not accessible`), size, bytes copied,
+  SHA-256, times and, for a failure, the error; and every folder that
+  couldn't be listed (`folder not listed`, with the reason).
 
 ## What it collects
 
@@ -159,17 +168,20 @@ and counted.
 - `<profile>` is any browser profile folder.
 - Within each artefact, locations run from current Windows to legacy forms and
   then `Windows.old`.
-- Junctions and symbolic links are not followed, including Windows' own
+- Folder junctions and symbolic links are not followed, including Windows' own
   compatibility links (`Default User`, `All Users`, `Documents and Settings`);
-  they only point back to folders already covered.
+  they only point back to folders already covered. File symbolic links are
+  not followed either.
+- Empty (0-byte) files and file symbolic links are left out of the zip, of
+  `collection.csv` and of every count.
 - Paths are resolved from `%SystemDrive%`, so non-`C:` installs work too.
-- Per-volume artefacts (Recycle Bin, and the NTFS metafiles under
+- Per-drive artefacts (Recycle Bin, and the NTFS metafiles under
   [What it can't collect](#what-it-cant-collect)) are taken from every local
   drive, fixed or removable (NTFS, FAT or exFAT), e.g. `C:`, `D:` and a USB
   drive; network drives are not.
 - Inside the zip, files keep their original path
   (e.g. `C/Windows/Prefetch/...`), including names that end with a dot or a
-  space.
+  space; `collection.csv` sits at the root beside the drive folders.
 
 | Artefact | Location |
 |---|---|
@@ -219,6 +231,7 @@ ready-to-paste `getfile` command at the end.
 | File-system metadata of FAT and exFAT drives (allocation table, directory entries) | Not stored as files | FAT/exFAT parser | Not possible via `getfile`; a raw-disk collector |
 | System hives (`SAM`, `SECURITY`, `SOFTWARE`, `SYSTEM`) and their transaction logs | Held exclusively by the kernel while loaded | NTFS parser | `getfile` for the hives (printed) |
 | SRUM (`SRUDB.dat` and its ESE files) | Sometimes held open by the system (collected when it isn't) | NTFS parser | `getfile` (printed) |
+| BITS (`qmgr.db` and its ESE files) | Held by the BITS service while it runs: a demand-start service that stops itself when idle (collected when stopped) | NTFS parser | `getfile` (printed) |
 | Service account hives (`DEFAULT`, LocalService and NetworkService `NTUSER.DAT`) and their transaction logs | Loaded while Windows runs | NTFS parser | `getfile` manually (not printed) |
 | User Access Logging `Current.mdb` (servers) | Usually held open by the UAL service | NTFS parser | `getfile` (printed) |
 | User hives of logged-on users (`NTUSER.DAT`, `UsrClass.dat`) and their transaction logs | Held exclusively while the user is logged on | NTFS parser | `getfile` for the hives (printed) |
@@ -227,7 +240,7 @@ ready-to-paste `getfile` command at the end.
 Hives of users who are not logged on, and most other in-use files (EVTX, a
 running browser's History), are collected normally. If any other
 machine-wide file turns out to be locked, it is added to the printed `getfile`
-list (transaction logs excepted).
+list (registry transaction logs excepted).
 
 ## How it works
 
@@ -247,7 +260,17 @@ list (transaction logs excepted).
   accessible*, never *Missing*, and is named under the summary. A copy that
   fails part-way stays in the zip, incomplete (a zip can't drop an entry once
   written), and is named under the summary with the bytes copied; so is a
-  live file whose size changed while it was copied.
+  live file whose size changed while it was copied. Both carry their outcome
+  in `collection.csv`.
+- **Per-file record.** `collection.csv` is written into the zip last, one row
+  per file collected or found but not readable: artefact, outcome, source
+  path, zip entry, size when opened, bytes copied, the SHA-256 of the bytes
+  written (hashed as they are copied), the file's own created, modified and
+  accessed times (read just before it is opened, UTC with `Z`), and the error
+  for a failure. A folder that couldn't be listed has a row per artefact that
+  met it (`folder not listed`, the folder and the reason), so every
+  *Not accessible* count in the summary has a row behind it.
+  Every cell is quoted; UTF-8 without BOM, CRLF.
 - **Locked files.** Files are opened with shared read access, so in-use files
   are copied where Windows allows it. Files held exclusively are skipped (see
   [What it can't collect](#what-it-cant-collect)).
@@ -255,8 +278,8 @@ list (transaction logs excepted).
   (`\\?\`), so names Windows would otherwise alter (a trailing dot or space,
   `nul`, paths over 260 characters) are read as the file they name.
 - **Single pass.** Files are streamed straight into the zip
-  (`System.IO.Compression`, fastest compression) with no temporary copies.
-  Zip entry times are each file's last-write time in UTC.
+  (`System.IO.Compression`, fastest compression) with no temporary copies and
+  hashed on the way. Zip entry times are each file's last-write time in UTC.
 - **Split volumes.** A zip over 1 GiB is split in place at the end into
   standard split volumes, `<name>.zip.001`, `.002`, ... (a byte split of the
   one zip, all but the last exactly 1 GiB). Splitting needs free space for one
@@ -300,7 +323,9 @@ Warnings, whatever its note.
 
 Browser History counts browser profiles, not files; a profile counts as
 collected only if its history database was read (a locked database with
-readable journal or logs is *Not accessible*).
+readable journal or logs is *Not accessible*). Empty files are not counted:
+an artefact whose only files are empty reads *Missing*. File symbolic links
+are not counted either.
 
 ## What the output shows
 
@@ -311,10 +336,16 @@ readable journal or logs is *Not accessible*).
 - The run log and the console say what was collected, what wasn't and why, on
   which host, under which Windows version, from which drives, and when (UTC),
   with the script's version.
-- Each zip entry's time is the file's last-write time in UTC. Creation and
-  access times are not kept.
+- `collection.csv` names every folder that couldn't be listed, and says, for
+  every file collected or found but not readable, what happened to it: the
+  outcome, the size when opened and the bytes copied, the SHA-256 of what the
+  zip holds for it, and its created, modified and accessed times as the file
+  system reported them just before the file was opened. Each zip entry's time
+  is the file's last-write time in UTC, to the 2 seconds the zip format holds;
+  the MFT change time is not recorded.
 - A file that was being written to while it was copied is in the zip as it was
-  read, and is named under the summary when its size changed.
+  read, and is named under the summary and in `collection.csv` as
+  `size changed`.
 - The run says nothing about the source after it ended: the device is live,
   and the same files will not hash the same later.
 - The SHA-256 is printed by the script on the device; it shows the download
@@ -327,8 +358,11 @@ readable journal or logs is *Not accessible*).
   ([What it can't collect](#what-it-cant-collect)).
 - No chain of custody after collection: no sealed records, no history of
   copies.
-- No per-file hashes: the sources are live, so they couldn't be checked again
-  later; the zip's SHA-256 fixes what was collected.
+- No verification against the source: the hashes in `collection.csv` are of
+  the bytes as read, and the sources are live, so they can't be checked again
+  later. The zip's SHA-256 fixes what was collected.
+- No following of links: folder links and file symbolic links are skipped,
+  and not recorded.
 - No third-party application artefacts beyond browser history, and no browser
   data beyond history (no cookies, caches or saved passwords).
 - No cleanup: the output stays in its folder until you remove it.
@@ -346,8 +380,9 @@ welcome.
   row, after the current one.
 - **Conventions:** Windows PowerShell 5.1 only, no modules, no child
   processes or `Add-Type`; PSScriptAnalyzer-clean; times in UTC; British
-  spelling in output and documentation. Every failure is isolated to its own
-  location and reported, never silent.
+  spelling in output and documentation. Full-word names; a function returns
+  its outcome rather than setting shared state. Every failure is isolated to
+  its own location and reported, never silent.
 - Changes are listed in [CHANGELOG.md](CHANGELOG.md).
 
 ## Licence

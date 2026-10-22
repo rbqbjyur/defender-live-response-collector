@@ -14,13 +14,14 @@
     in Windows\SystemTemp or the account's temp folder, and prints a
     per-artefact summary, the getfile command for the zip, and getfile commands
     for locked machine-wide files it could not read, with the SHA-256 of the
-    zip (or of each volume) to check the download against. A zip larger than the
-    part size set in CONFIG is split into standard split volumes
-    (<name>.zip.001, .002, ...).
+    zip (or of each volume) to check the download against. A zip larger than
+    the volume size set in CONFIG is split into standard split volumes
+    (<name>.zip.001, .002, ...). The zip holds collection.csv, one row per file
+    the run attempted: its outcome, size, bytes copied, SHA-256 and times.
 
-    Best effort: anything that can't be read is skipped silently and counted in
-    the summary; the run never stops on an error. No child processes are
-    started, and the output is left in place for retrieval.
+    Best effort: anything that can't be read is skipped and counted in the
+    summary; the run never stops on an error. No child processes are started,
+    and the output is left in place for retrieval.
 
 .EXAMPLE
     run collector.ps1
@@ -41,25 +42,30 @@
     https://github.com/rbqbjyur/defender-live-response-collector
 #>
 
-# Every catch {} in this script is deliberate: failures are skipped and the run
-# carries on (best effort, no failure log - see the project's design rules).
+# Every empty catch {} in this script is deliberate: it guards a step whose
+# failure leaves the documented default in place (a fact stays unknown, a close
+# is skipped) and must never stop the rest (best effort - see the project's
+# design rules). Every skip of real work has its own catch that records the
+# outcome.
 [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSAvoidUsingEmptyCatchBlock', '',
-    Justification = 'Best-effort collection: unreadable items are skipped silently by design.')]
+    Justification = 'Each empty catch guards a step whose failure leaves the documented default in place (a fact stays unknown, a close is skipped); it must never stop the rest of the run.')]
 [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '',
     Justification = 'Internal helpers of a non-interactive Live Response script: no -WhatIf or -Confirm.')]
 param()
 
 # ============================== CONFIG ==============================
 
-$CollectorVersion = '1.5.0'
+$CollectorVersion = '2.0.0'
 
-$ErrorActionPreference = 'SilentlyContinue'
-$ProgressPreference    = 'SilentlyContinue'
+# No script-wide error suppression: every unit of work has its own try/catch,
+# so an error nobody anticipated shows (in the Live Response transcript) rather
+# than vanishing. Progress bars are off: they have no place in a transcript.
+$ProgressPreference = 'SilentlyContinue'
 
 # Resolve the system drive from the environment so the script is not tied to a C:
 # install; every artefact path below is taken relative to it (or to a profile).
-$sysDrive = $env:SystemDrive                 # e.g. C:
-if (-not $sysDrive) { $sysDrive = [System.IO.Path]::GetPathRoot([Environment]::SystemDirectory).TrimEnd('\') }
+$systemDrive = $env:SystemDrive                 # e.g. C:
+if (-not $systemDrive) { $systemDrive = [System.IO.Path]::GetPathRoot([Environment]::SystemDirectory).TrimEnd('\') }
 
 $hostName = $env:COMPUTERNAME
 # UTC, so the name is unambiguous across time zones; trailing 'Z' marks it as UTC.
@@ -70,12 +76,12 @@ $timestamp = $runStart.ToString('yyyyMMdd_HHmmss') + 'Z'
 # created and holds the zip wins. Only the last folder in each path is ever
 # created - a candidate whose parent doesn't exist is skipped. Each run adds its
 # own zip, so repeated collections accumulate side by side.
-$outDirs = @(
+$outputFolders = @(
     # The Defender for Endpoint sensor's own Temp (Live Response keeps its script
     # transcripts there too).
-    Join-Path $sysDrive 'ProgramData\Microsoft\Windows Defender Advanced Threat Protection\Temp\Collections'
+    Join-Path $systemDrive 'ProgramData\Microsoft\Windows Defender Advanced Threat Protection\Temp\Collections'
     # The SYSTEM-only temp folder of newer Windows builds (SYSTEM and Administrators).
-    Join-Path $sysDrive 'Windows\SystemTemp\LiveResponseCollector'
+    Join-Path $systemDrive 'Windows\SystemTemp\LiveResponseCollector'
     # The running account's temp folder (C:\Windows\Temp for SYSTEM).
     Join-Path ([System.IO.Path]::GetTempPath()) 'LiveResponseCollector'
 )
@@ -85,7 +91,11 @@ $zipName = "${hostName}_${timestamp}.zip"
 # split volumes - <name>.zip.001, .002, ... (a byte split of the one zip: join
 # them, or open .001 in 7-Zip) - so each getfile stays well within its 3 GB and
 # time limits. A zip that fits is left as it is.
-$zipPartSize = 1GB
+$zipVolumeSize = 1GB
+
+# The per-file record inside the zip, at its root beside the drive folders: one
+# row per file the run attempted (see $fileRecordColumns for the columns).
+$fileRecordName = 'collection.csv'
 
 # Where user profiles live, relative to the system drive: modern first, then
 # legacy (XP). Each folder under a root is one profile (see Get-UserProfilePath).
@@ -94,9 +104,9 @@ $profileRoots = @('Users', 'Documents and Settings')
 # Reasons a gap is normal for the host, shared by the artefact rows' ExpectMissing
 # rules so the same reason always reads the same in the summary. Only known OS or
 # configuration reasons (off by default, not on this edition/version, not
-# configured) - never usage or changeable state, as an artefact that is merely empty or
-# absent may have been removed and belongs under Warnings. Add a reason here,
-# then refer to it from a row.
+# configured) - never usage or changeable state, as an artefact that is merely
+# empty or absent may have been removed and belongs under Warnings. Add a reason
+# here, then refer to it from a row.
 $gapReasons = @{
     Server          = 'normal for Windows Server'
     ServerOnly      = 'Windows Server only'
@@ -109,14 +119,15 @@ $gapReasons = @{
 #   Name     Summary label.
 #   Group    1 = drive root (NTFS metafiles), 2 = other system files, 3 = user-specific.
 #   System   Path pattern(s) relative to the system drive (or to each drive, see
-#            Volumes).
-#   Volumes  Which drives the System patterns apply to: 'System' (the default; the
+#            Drives).
+#   Drives   Which drives the System patterns apply to: 'System' (the default; the
 #            system drive only), 'All' (every ready local drive - fixed or
 #            removable, any file system) or 'NTFS' (those formatted NTFS, for the
 #            NTFS metafiles, which FAT/exFAT have no file equivalent of). For
-#            per-volume artefacts such as the Recycle Bin.
+#            per-drive artefacts such as the Recycle Bin.
 #   User     Path pattern(s) relative to each user profile.
-#   Logs     Also collect each match's registry transaction logs (<file>.LOG1/.LOG2).
+#   TransactionLogs  Also collect each match's registry transaction logs
+#            (<file>.LOG1/.LOG2). Those never get a printed getfile command.
 #   Literal  Use the path as-is, without listing it. For NTFS metafiles, which
 #            PowerShell can neither see nor open: they stay as 'Not accessible'
 #            placeholders so future raw/sensor-based collection slots in cleanly.
@@ -124,12 +135,13 @@ $gapReasons = @{
 #            command is printed at the end if the read failed.
 #   FollowUp Which of the row's locked files get a printed getfile command:
 #            'System' (machine-wide paths; the default) or 'User' (user-profile
-#            paths). Transaction logs (.LOG*) never do.
+#            paths).
 #   CountBy  'Folder' counts one unit per folder holding matches (e.g. per browser
 #            profile) instead of one per file.
-#   Supporting  CountBy rows: file-name patterns of supporting files (journals,
-#            ESE logs). A unit counts as collected only if its main file was read;
-#            supporting files alone don't count while a main file is present.
+#   SupportingFiles  CountBy rows: file-name patterns of supporting files
+#            (journals, ESE logs). A unit counts as collected only if its main
+#            file was read; supporting files alone don't count while a main file
+#            is present.
 #   ExpectMissing  Rules for when "Missing" is normal for this artefact: a list of
 #            @{ When = { condition on $hostInfo, see Get-HostInfo }; Why = <a reason
 #            from $gapReasons> }. The first rule that holds gives the note "(<Why>)".
@@ -142,8 +154,9 @@ $gapReasons = @{
 #            expected, so unusual gaps stand out (they go to Warnings).
 #   Requires What reading this artefact's locked files would take, shown in that
 #            note; defaults to 'NTFS parser' (matches the README's table).
-#   RegDirs  Folders named by registry values (Key, Value), each searched with its
-#            Pattern. Local drive paths only: shares are skipped (no network access).
+#   RegistryFolders  Folders named by registry values (Key, Value), each searched
+#            with its Pattern. Local drive paths only: shares are skipped (no
+#            network access).
 # Within a row, patterns run from the modern, standard location to legacy and
 # alternative ones: current Windows first, then older Windows forms (Windows 7,
 # XP), then the previous install kept in Windows.old after a feature update.
@@ -154,16 +167,16 @@ $gapReasons = @{
 # this list doesn't matter - but keep it in that order for readability.
 $artefacts = @(
     # 1. Drive root: the timeline-relevant NTFS metafiles (the "NTFS Triforce").
-    @{ Name = '$LogFile';    Group = 1; Volumes = 'NTFS'; ExpectLocked = { <# NTFS metafile #> $true }; Literal = $true; System = '$LogFile' }   # no getfile route (reported as empty)
-    @{ Name = '$MFT';        Group = 1; Volumes = 'NTFS'; ExpectLocked = { <# NTFS metafile #> $true }; Literal = $true; GetFile = $true; System = '$MFT' }
-    @{ Name = '$UsnJrnl:$J'; Group = 1; Volumes = 'NTFS'; ExpectLocked = { <# NTFS metafile #> $true }; Literal = $true; System = '$Extend\$UsnJrnl:$J' }   # no getfile route
+    @{ Name = '$LogFile';    Group = 1; Drives = 'NTFS'; ExpectLocked = { <# NTFS metafile #> $true }; Literal = $true; System = '$LogFile' }   # no getfile route (reported as empty)
+    @{ Name = '$MFT';        Group = 1; Drives = 'NTFS'; ExpectLocked = { <# NTFS metafile #> $true }; Literal = $true; GetFile = $true; System = '$MFT' }
+    @{ Name = '$UsnJrnl:$J'; Group = 1; Drives = 'NTFS'; ExpectLocked = { <# NTFS metafile #> $true }; Literal = $true; System = '$Extend\$UsnJrnl:$J' }   # no getfile route
 
     # 2. Other system files.
     # Application compatibility / program execution records: Amcache.hve and the
     # Program Compatibility Assistant files (Windows 11 22H2+), then their
     # predecessors - RecentFileCache.bcf (Windows 7) and Syscache.hve (Windows 7 /
     # Server 2008 R2), both replaced by Amcache.hve in Windows 8 - then Windows.old.
-    @{ Name = 'Application Compatibility'; Group = 2; ExpectPresent = { <# Amcache, or RecentFileCache on Windows 7 #> $true }; Logs = $true
+    @{ Name = 'Application Compatibility'; Group = 2; ExpectPresent = { <# Amcache, or RecentFileCache on Windows 7 #> $true }; TransactionLogs = $true
        ExpectLocked = { <# Syscache.hve is a loaded hive before Windows 8 #> $hostInfo.Build -and $hostInfo.Build -lt 9200 }
        System = @(
            'Windows\AppCompat\Programs\Amcache.hve'
@@ -213,7 +226,7 @@ $artefacts = @(
     # Transaction logs hold un-flushed changes, so Registry Explorer / RegRipper /
     # plaso can replay a dirty hive and recover the most recent entries. RegBack
     # copies are usually empty on current Windows, but older snapshots when present.
-    @{ Name = 'Registry Hives (system)'; Group = 2; ExpectPresent = { $true }; ExpectLocked = { <# loaded hives #> $true }; Logs = $true; System = @(
+    @{ Name = 'Registry Hives (system)'; Group = 2; ExpectPresent = { $true }; ExpectLocked = { <# loaded hives #> $true }; TransactionLogs = $true; System = @(
         'Windows\System32\config\SAM'
         'Windows\System32\config\SECURITY'
         'Windows\System32\config\SOFTWARE'
@@ -281,7 +294,7 @@ $artefacts = @(
     # first, then IE / legacy Edge (WebCache, index.dat) and other discontinued
     # browsers or formats, then XP profile paths.
     @{ Name = 'Browser History'; Group = 3; ExpectLocked = { <# WebCache / running browsers #> $true }; CountBy = 'Folder'
-       Supporting = @('*-journal', '*-wal', '*-shm', '*Provider Cache', '*.log', '*.chk', '*.jrs', '*.jfm')
+       SupportingFiles = @('*-journal', '*-wal', '*-shm', '*Provider Cache', '*.log', '*.chk', '*.jrs', '*.jfm')
        System = @(
            'Windows\System32\config\systemprofile\AppData\Local\Google\Chrome\User Data\*\History*'
            'Windows\System32\config\systemprofile\AppData\Local\Google\Chrome Beta\User Data\*\History*'
@@ -393,19 +406,19 @@ $artefacts = @(
            'OneDrive*\Documents\PowerShell_transcript.*.txt'
            'OneDrive*\Documents\20*\PowerShell_transcript.*.txt'
        )
-       RegDirs = @(
+       RegistryFolders = @(
            @{ Key = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\PowerShell\Transcription'; Value = 'OutputDirectory'; Pattern = '**\PowerShell_transcript.*.txt' }
            @{ Key = 'HKLM:\SOFTWARE\Policies\Microsoft\PowerShellCore\Transcription';     Value = 'OutputDirectory'; Pattern = '**\PowerShell_transcript.*.txt' }
        ) }
     # Recycle Bin metadata only ($I records; INFO2 on XP), no deleted-file content.
-    @{ Name = 'Recycle Bin'; Group = 3; Volumes = 'All'; System = @(
+    @{ Name = 'Recycle Bin'; Group = 3; Drives = 'All'; System = @(
         '$Recycle.Bin\*\$I*'
         '$Recycle.Bin\$I*'                                               # FAT/exFAT: no per-SID folders
         'RECYCLE*\**\INFO2'                                              # XP (RECYCLER / RECYCLED)
     ) }
     # User hives, plus the service accounts' hives: DEFAULT is the SYSTEM account's
     # (HKU\.DEFAULT / S-1-5-18), the others LocalService and NetworkService.
-    @{ Name = 'Registry Hives (user)'; Group = 3; ExpectPresent = { $true }; ExpectLocked = { <# logged-on users' and service hives #> $true }; Logs = $true; FollowUp = 'User'   # users' hives, not the built-in service accounts'
+    @{ Name = 'Registry Hives (user)'; Group = 3; ExpectPresent = { $true }; ExpectLocked = { <# logged-on users' and service hives #> $true }; TransactionLogs = $true; FollowUp = 'User'   # users' hives, not the built-in service accounts'
        System = @(
            'Windows\System32\config\DEFAULT'
            'Windows\System32\config\systemprofile\NTUSER.DAT'
@@ -438,24 +451,77 @@ $artefacts = @(
     @{ Name = 'Windows Timeline'; Group = 3; ExpectMissing = @(@{ When = { $hostInfo.Server }; Why = $gapReasons.Server }; @{ When = { $hostInfo.Build -ge 22000 }; Why = $gapReasons.WindowsVersion }); User = 'AppData\Local\ConnectedDevicesPlatform\**\ActivitiesCache.db*' }
 )
 
-# ============================= FUNCTIONS =============================
+# The columns of collection.csv, one row per file the run attempted and one per
+# folder it couldn't list:
+#   Artefact     the summary row the file or folder belongs to ('User profiles'
+#                for a profile root that couldn't be listed)
+#   Outcome      collected | size changed | incomplete | not accessible
+#                (see Copy-FileToZip) | folder not listed (every other cell
+#                but Detail empty)
+#   Source       the file's path on the device, or the folder's
+#   Entry        its path inside the zip ('' when nothing was written)
+#   Size         its size in bytes when opened ('' if it couldn't be opened)
+#   BytesCopied  the bytes written to the zip entry
+#   SHA-256      of those bytes, lower-case hex ('' when nothing was written)
+#   Created, Modified, Accessed  the file's own times, read just before the open
+#                (Get-FileOwnTime), UTC (ISO 8601, Z); '' where unknown or the
+#                file was never listed (NTFS metafiles)
+#   Detail       the error, for a failure ("access denied" or the error, for a
+#                folder not listed)
+# Empty files and file symbolic links are not attempted and have no row (owner's
+# decision): the record lists what was collected and what couldn't be read. A
+# folder not listed has one row per artefact that met it, as each of those
+# counts it once in its summary line; a file has one row in all.
+$fileRecordColumns = @('Artefact', 'Outcome', 'Source', 'Entry', 'Size', 'BytesCopied', 'SHA-256', 'Created', 'Modified', 'Accessed', 'Detail')
 
-# --- Filesystem enumeration (low-level first) ---
+# ============================= FUNCTIONS =============================
+#
+# Conventions: a function returns its outcome; it never records one in script
+# state. Where a function meets a folder it can't list, it adds that folder to
+# the list its caller passes as -FoldersNotListed, so the side effect is named at
+# every call site. Script-scope state is limited to caches, the run log and the
+# console (see MAIN).
+
+# --- Text helpers ---
+
+# An error's message on one line (some end with a line break), for the console,
+# the log and the per-file record.
+function Get-OneLineMessage {
+    param($ErrorRecord)
+    return (($ErrorRecord.Exception.Message -replace '\s*[\r\n]+\s*', ' ').Trim())
+}
+
+# One CSV line: every cell quoted, a quote inside a cell doubled (RFC 4180).
+function ConvertTo-CsvLine {
+    param([string[]]$Cells)
+    $quotedCells = foreach ($cell in $Cells) { '"' + ([string]$cell -replace '"', '""') + '"' }
+    return ($quotedCells -join ',')
+}
+
+# A file time for the per-file record: ISO 8601 in UTC with a trailing Z and
+# 100 ns precision (the file system's own precision); empty when unknown.
+function Format-RecordTime {
+    param($DateTimeUtc)
+    if ($null -eq $DateTimeUtc) { return '' }
+    return ([DateTime]$DateTimeUtc).ToUniversalTime().ToString('o')
+}
+
+# --- Links and names ---
 
 # True if a folder (a DirectoryInfo from Get-Item or Get-ChildItem) is a
-# junction or symbolic link. Links are never followed: on Windows they only
-# duplicate real folders ("All Users", "Default User", the XP compatibility
-# links such as "Local Settings" or "Application Data" inside profiles).
-# PowerShell 5.1 leaves LinkType empty for a link that denies listing to
-# everyone, as Windows' own compatibility links do, so a reparse point whose
-# type can't be read and whose listing is denied counts as a link too. Other
-# reparse points that can be listed (e.g. OneDrive cloud folders) are ordinary
-# folders.
-function Test-LinkItem {
+# junction or symbolic link. Folder links are never followed: on Windows they
+# only duplicate real folders ("All Users", "Default User", the XP
+# compatibility links such as "Local Settings" or "Application Data" inside
+# profiles). PowerShell 5.1 leaves LinkType empty for a link that denies
+# listing to everyone, as Windows' own compatibility links do, so a reparse
+# point whose type can't be read and whose listing is denied counts as a link
+# too. Other reparse points that can be listed (e.g. OneDrive cloud folders)
+# are ordinary folders.
+function Test-FolderItemIsLink {
     param($Item)
-    $type = $Item.LinkType
-    if ($type -eq 'Junction' -or $type -eq 'SymbolicLink') { return $true }
-    if ($type -or -not ($Item.Attributes -band [System.IO.FileAttributes]::ReparsePoint)) { return $false }
+    $linkType = $Item.LinkType
+    if ($linkType -eq 'Junction' -or $linkType -eq 'SymbolicLink') { return $true }
+    if ($linkType -or -not ($Item.Attributes -band [System.IO.FileAttributes]::ReparsePoint)) { return $false }
     $entries = $null
     try {
         $entries = [System.IO.Directory]::EnumerateFileSystemEntries($Item.FullName).GetEnumerator()
@@ -470,183 +536,245 @@ function Test-LinkItem {
     }
 }
 
-# True if Path is a junction or symbolic link (see Test-LinkItem). Cached, as the
-# same folders are checked for many patterns.
-function Test-FolderLink {
-    param([string]$Path)
-    if ($script:linkCache.ContainsKey($Path)) { return $script:linkCache[$Path] }
-    $isLink = $false
-    try {
-        if (Test-NormalisedName -Path $Path) {
-            # Get-Item would return the folder without the trailing dot or space.
-            $item = New-Object System.IO.DirectoryInfo ('\\?\' + $Path)
-            if ($item.Exists) { $isLink = Test-LinkItem -Item $item }
-        } else {
-            $isLink = Test-LinkItem -Item (Get-Item -LiteralPath $Path -Force -ErrorAction Stop)
-        }
-    } catch {}
-    $script:linkCache[$Path] = $isLink
-    return $isLink
+# True if a file (a FileInfo from a listing) is a symbolic link. A file link is
+# never followed: its content would arrive from outside the searched location
+# under a name inside it (the reference collector skips them too). It is left
+# out entirely, like an empty file. Only symbolic links count: a file reparse
+# point of another kind (a OneDrive cloud file, a deduplicated file) is a file
+# to read, and a hard link can't be told from the file itself.
+function Test-FileItemIsSymbolicLink {
+    param($Item)
+    if (-not ($Item.Attributes -band [System.IO.FileAttributes]::ReparsePoint)) { return $false }
+    try { return ($Item.LinkType -eq 'SymbolicLink') } catch { return $false }
 }
 
-# An error's message on one line (some end with a line break), for the console
-# and the log.
-function Get-OneLineMessage {
-    param($ErrorRecord)
-    return (($ErrorRecord.Exception.Message -replace '\s*[\r\n]+\s*', ' ').Trim())
-}
-
-# Record a folder that exists but could not be listed (access denied, an I/O
-# error), so what it holds counts as not accessible rather than missing. A
-# folder that doesn't exist is no failure: that is what Missing means. Each
-# failure goes into $script:listingFailures (Path, Reason), where Add-Artefact
-# picks up the ones its patterns met.
-function Add-ListingFailure {
-    param([string]$Path, $ErrorRecords)
-    foreach ($record in @($ErrorRecords)) {
-        if (-not $record) { continue }
-        if ($record.CategoryInfo.Category -eq 'ObjectNotFound') { continue }
-        $reason = if ($record.CategoryInfo.Category -eq 'PermissionDenied') { 'access denied' } else { Get-OneLineMessage -ErrorRecord $record }
-        $script:listingFailures.Add([pscustomobject]@{ Path = $Path; Reason = $reason })
-        return
-    }
+# The target of a link item, or '' if it can't be read.
+function Get-LinkTarget {
+    param($Item)
+    try { return [string](@($Item.Target)[0]) } catch { return '' }
 }
 
 # True if a name in Path ends with a dot or a space (e.g. 'dir.' or 'space ').
 # PowerShell's listing normalises such a path to the name without them, so it
 # lists another folder (or none): these folders are listed with .NET through
-# \\?\ instead (Get-ExtendedChildPath).
-function Test-NormalisedName {
+# the \\?\ prefix instead (Get-ChildFolderWithExtendedPrefix,
+# Get-ChildFileWithExtendedPrefix).
+function Test-NameEndsInDotOrSpace {
     param([string]$Path)
     return ($Path -match '[. ](\\|$)')
 }
 
-# Full paths of the files (or, with -Directory, the subfolders other than links)
-# in Path matching Filter, listed with .NET through \\?\, for a folder whose
-# name PowerShell would normalise (Test-NormalisedName). A folder that can't be
-# listed is recorded (Add-ListingFailure); where .NET refuses \\?\ (Framework
-# before 4.6.2) the reason says the name can't be listed here.
-function Get-ExtendedChildPath {
-    param([string]$Path, [string]$Filter = '*', [switch]$Directory)
-    try {
-        $folder = New-Object System.IO.DirectoryInfo ('\\?\' + $Path)
-        $items  = if ($Directory) { $folder.EnumerateDirectories($Filter) } else { $folder.EnumerateFiles($Filter) }
-        foreach ($item in $items) {
-            if ($Directory -and (Test-LinkItem -Item $item)) { continue }
-            $item.FullName.Substring(4)   # without the \\?\ prefix
-        }
-    } catch {
-        $inner = $_.Exception
-        while ($inner.InnerException) { $inner = $inner.InnerException }
-        if ($inner -is [System.IO.DirectoryNotFoundException]) { return }
-        $reason = if ($inner -is [System.NotSupportedException] -or $inner -is [System.ArgumentException]) {
-            'its name ends in a dot or a space, which this .NET version cannot list'
-        } elseif ($inner -is [System.UnauthorizedAccessException]) {
-            'access denied'
-        } else {
-            Get-OneLineMessage -ErrorRecord $_
-        }
-        $script:listingFailures.Add([pscustomobject]@{ Path = $Path; Reason = $reason })
-    }
-}
-
-# Full paths of the subfolders of Path matching Filter, skipping links (see
-# Test-FolderLink). A folder that can't be listed is recorded (Add-ListingFailure).
-function Get-ChildDirectory {
-    param([string]$Path, [string]$Filter = '*')
-    if (Test-NormalisedName -Path $Path) { return Get-ExtendedChildPath -Path $Path -Filter $Filter -Directory }
-    $listingErrors = $null
-    try {
-        Get-ChildItem -LiteralPath $Path -Filter $Filter -Directory -Force -ErrorAction SilentlyContinue -ErrorVariable listingErrors |
-            Where-Object { -not (Test-LinkItem -Item $_) } |
-            ForEach-Object { $_.FullName }
-    } catch { $listingErrors = @($_) }
-    Add-ListingFailure -Path $Path -ErrorRecords $listingErrors
-}
-
 # A folder path safe to list: a bare drive ('C:') means that drive's current
 # directory to PowerShell, so it becomes the drive root ('C:\').
-function Get-ListPath {
+function ConvertTo-ListablePath {
     param([string]$Path)
     if ($Path -match '^[A-Za-z]:$') { return $Path + '\' }
     return $Path
 }
 
+# --- Folder listing ---
+
+# Record a folder that exists but could not be listed (access denied, an I/O
+# error) in FoldersNotListed, so what it holds counts as not accessible rather
+# than missing. A folder that doesn't exist is no failure: that is what Missing
+# means. Only the first error of a listing is recorded.
+function Add-FolderNotListed {
+    param([string]$Path, $ErrorRecords, [System.Collections.Generic.List[object]]$FoldersNotListed)
+    foreach ($record in @($ErrorRecords)) {
+        if (-not $record) { continue }
+        if ($record.CategoryInfo.Category -eq 'ObjectNotFound') { continue }
+        $reason = if ($record.CategoryInfo.Category -eq 'PermissionDenied') { 'access denied' } else { Get-OneLineMessage -ErrorRecord $record }
+        $FoldersNotListed.Add([pscustomobject]@{ Path = $Path; Reason = $reason })
+        return
+    }
+}
+
+# Add folders not listed (Path, Reason) to Table, an ordered folder path ->
+# reason table, keeping the first reason met for each folder. Walks the list
+# with foreach: Windows PowerShell 5.1 throws "Argument types do not match"
+# for @() applied to a List[object] variable (round 2).
+function Add-FolderToNotListedTable {
+    param($Table, $Folders)
+    foreach ($folder in $Folders) {
+        if ($folder -and -not $Table.Contains($folder.Path)) { $Table[$folder.Path] = $folder.Reason }
+    }
+}
+
+# The reason a .NET listing through \\?\ failed, in the words the console uses;
+# '' when the folder simply doesn't exist.
+function Get-ExtendedListingFailureReason {
+    param($ErrorRecord)
+    $innermost = $ErrorRecord.Exception
+    while ($innermost.InnerException) { $innermost = $innermost.InnerException }
+    if ($innermost -is [System.IO.DirectoryNotFoundException]) { return '' }
+    if ($innermost -is [System.NotSupportedException] -or $innermost -is [System.ArgumentException]) {
+        return 'its name ends in a dot or a space, which this .NET version cannot list'
+    }
+    if ($innermost -is [System.UnauthorizedAccessException]) { return 'access denied' }
+    return (Get-OneLineMessage -ErrorRecord $ErrorRecord)
+}
+
+# Full paths of the subfolders (other than links) of a folder whose name
+# PowerShell would normalise (Test-NameEndsInDotOrSpace), listed with .NET
+# through \\?\. A listing that fails is recorded in FoldersNotListed.
+function Get-ChildFolderWithExtendedPrefix {
+    param([string]$Path, [string]$Filter = '*', [System.Collections.Generic.List[object]]$FoldersNotListed)
+    try {
+        $folder = New-Object System.IO.DirectoryInfo ('\\?\' + $Path)
+        foreach ($subfolder in $folder.EnumerateDirectories($Filter)) {
+            if (Test-FolderItemIsLink -Item $subfolder) { continue }
+            $subfolder.FullName.Substring(4)   # without the \\?\ prefix
+        }
+    } catch {
+        $reason = Get-ExtendedListingFailureReason -ErrorRecord $_
+        if ($reason) { $FoldersNotListed.Add([pscustomobject]@{ Path = $Path; Reason = $reason }) }
+    }
+}
+
+# The files of such a folder (see Get-ChildFolderWithExtendedPrefix), as
+# matches: @{ Path = the plain path; Item = the FileInfo from the listing }.
+function Get-ChildFileWithExtendedPrefix {
+    param([string]$Path, [string]$Filter = '*', [System.Collections.Generic.List[object]]$FoldersNotListed)
+    try {
+        $folder = New-Object System.IO.DirectoryInfo ('\\?\' + $Path)
+        foreach ($file in $folder.EnumerateFiles($Filter)) {
+            [pscustomobject]@{ Path = $file.FullName.Substring(4); Item = $file }
+        }
+    } catch {
+        $reason = Get-ExtendedListingFailureReason -ErrorRecord $_
+        if ($reason) { $FoldersNotListed.Add([pscustomobject]@{ Path = $Path; Reason = $reason }) }
+    }
+}
+
+# Full paths of the subfolders of Path matching Filter, skipping links (see
+# Test-FolderItemIsLink). A folder that can't be listed is recorded in
+# FoldersNotListed.
+function Get-ChildFolder {
+    param([string]$Path, [string]$Filter = '*', [System.Collections.Generic.List[object]]$FoldersNotListed)
+    if (Test-NameEndsInDotOrSpace -Path $Path) {
+        return (Get-ChildFolderWithExtendedPrefix -Path $Path -Filter $Filter -FoldersNotListed $FoldersNotListed)
+    }
+    $listingErrors = $null
+    try {
+        Get-ChildItem -LiteralPath $Path -Filter $Filter -Directory -Force -ErrorAction SilentlyContinue -ErrorVariable listingErrors |
+            Where-Object { -not (Test-FolderItemIsLink -Item $_) } |
+            ForEach-Object { $_.FullName }
+    } catch { $listingErrors = @($_) }
+    Add-FolderNotListed -Path $Path -ErrorRecords $listingErrors -FoldersNotListed $FoldersNotListed
+}
+
+# The files of Path matching Filter, as matches (@{ Path; Item }). A folder
+# that can't be listed is recorded in FoldersNotListed.
+function Get-ChildFile {
+    param([string]$Path, [string]$Filter = '*', [System.Collections.Generic.List[object]]$FoldersNotListed)
+    if (Test-NameEndsInDotOrSpace -Path $Path) {
+        return (Get-ChildFileWithExtendedPrefix -Path $Path -Filter $Filter -FoldersNotListed $FoldersNotListed)
+    }
+    $listingErrors = $null
+    try {
+        Get-ChildItem -LiteralPath (ConvertTo-ListablePath -Path $Path) -Filter $Filter -File -Force -ErrorAction SilentlyContinue -ErrorVariable listingErrors |
+            ForEach-Object { [pscustomobject]@{ Path = $_.FullName; Item = $_ } }
+    } catch { $listingErrors = @($_) }
+    Add-FolderNotListed -Path $Path -ErrorRecords $listingErrors -FoldersNotListed $FoldersNotListed
+}
+
+# A folder and every folder below it, never following links, with no depth
+# limit. Folders that can't be listed are recorded in FoldersNotListed.
+function Get-FolderTree {
+    param([string]$Path, [System.Collections.Generic.List[object]]$FoldersNotListed)
+    $Path
+    foreach ($subfolder in (Get-ChildFolder -Path (ConvertTo-ListablePath -Path $Path) -FoldersNotListed $FoldersNotListed)) {
+        Get-FolderTree -Path $subfolder -FoldersNotListed $FoldersNotListed
+    }
+}
+
+# True if Path is a junction or symbolic link (see Test-FolderItemIsLink).
+# Cached in $script:folderLinkCache, as the same folders are checked for many
+# patterns.
+function Test-FolderPathIsLink {
+    param([string]$Path)
+    if ($script:folderLinkCache.ContainsKey($Path)) { return $script:folderLinkCache[$Path] }
+    $isLink = $false
+    try {
+        if (Test-NameEndsInDotOrSpace -Path $Path) {
+            # Get-Item would return the folder without the trailing dot or space.
+            $item = New-Object System.IO.DirectoryInfo ('\\?\' + $Path)
+            if ($item.Exists) { $isLink = Test-FolderItemIsLink -Item $item }
+        } else {
+            $isLink = Test-FolderItemIsLink -Item (Get-Item -LiteralPath $Path -Force -ErrorAction Stop)
+        }
+    } catch { $isLink = $false }   # a folder that can't be read is listed later, and recorded then
+    $script:folderLinkCache[$Path] = $isLink
+    return $isLink
+}
+
 # A folder path with each folder name in its on-disk case (e.g. a pattern's
 # '$Recycle.Bin' is '$RECYCLE.BIN' on a FAT drive), so zip entries keep the
-# original paths. A name that can't be found is kept as given. Cached per path,
-# so each folder is looked up once. Silent on failure: it only decides the case,
-# and the listings that follow record a folder that can't be read.
-function Get-DiskCasePath {
+# original paths. A name that can't be found is kept as given. Cached in
+# $script:onDiskCasePathCache, so each folder is looked up once. Silent on
+# failure: it only decides the case, and the listings that follow record a
+# folder that can't be read.
+function Get-OnDiskCasePath {
     param([string]$Path)
     $Path = $Path.TrimEnd('\')
-    if ($script:caseCache.ContainsKey($Path)) { return $script:caseCache[$Path] }
+    if ($script:onDiskCasePathCache.ContainsKey($Path)) { return $script:onDiskCasePathCache[$Path] }
     $result = $Path
-    $cut = $Path.LastIndexOf('\')
-    if ($cut -gt 0) {
-        $parent = Get-DiskCasePath -Path $Path.Substring(0, $cut)
-        $name   = $Path.Substring($cut + 1)
-        $result = $parent + '\' + $name
+    $lastSeparator = $Path.LastIndexOf('\')
+    if ($lastSeparator -gt 0) {
+        $parentPath = Get-OnDiskCasePath -Path $Path.Substring(0, $lastSeparator)
+        $name       = $Path.Substring($lastSeparator + 1)
+        $result     = $parentPath + '\' + $name
         try {
-            $match = Get-ChildItem -LiteralPath (Get-ListPath -Path $parent) -Filter $name -Force -ErrorAction SilentlyContinue |
+            $match = Get-ChildItem -LiteralPath (ConvertTo-ListablePath -Path $parentPath) -Filter $name -Force -ErrorAction SilentlyContinue |
                 Where-Object { $_.Name -eq $name } | Select-Object -First 1   # -eq: not a short-name (8.3) match
-            if ($match) { $result = $parent + '\' + $match.Name }
-        } catch {}
+            if ($match) { $result = $parentPath + '\' + $match.Name }
+        } catch { $result = $parentPath + '\' + $name }
     }
-    $script:caseCache[$Path] = $result
+    $script:onDiskCasePathCache[$Path] = $result
     return $result
 }
 
-# A folder and every folder below it, never following links (see Test-FolderLink).
-function Get-DirectoryTree {
-    param([string]$Path)
-    $Path
-    foreach ($d in (Get-ChildDirectory -Path (Get-ListPath -Path $Path))) { Get-DirectoryTree -Path $d }
-}
-
-# Expand a path pattern, relative to Root, into full file paths (none if absent).
-# Segments are separated by '\'. The last segment is a file-name filter (wildcards
-# allowed; a plain name matches just that file). A folder segment containing * or
-# ? matches subfolders; '**' as the last folder segment means "anywhere below
-# here" (recursive). Links are never followed (see Test-FolderLink). A folder
-# that can't be listed is recorded (Add-ListingFailure). -Literal returns
-# Root\Pattern unchecked, without listing it.
+# Expand a path pattern, relative to Root, into matches (@{ Path; Item }; none
+# if absent). Segments are separated by '\'. The last segment is a file-name
+# filter (wildcards allowed; a plain name matches just that file). A folder
+# segment containing * or ? matches subfolders; '**' as the last folder segment
+# means "anywhere below here" (recursive, no depth limit). Folder links are
+# never followed (Test-FolderItemIsLink). A folder that can't be listed is
+# recorded in FoldersNotListed. -Literal returns one match for Root\Pattern
+# unchecked, without listing it (Item is $null).
 function Resolve-PathPattern {
-    param([string]$Root, [string]$Pattern, [switch]$Literal)
+    param([string]$Root, [string]$Pattern, [switch]$Literal, [System.Collections.Generic.List[object]]$FoldersNotListed)
 
     $base = $Root.TrimEnd('\')
-    if ($Literal) { return ($base + '\' + $Pattern) }
-    $base = Get-DiskCasePath -Path $base
+    if ($Literal) { return [pscustomobject]@{ Path = ($base + '\' + $Pattern); Item = $null } }
+    $base = Get-OnDiskCasePath -Path $base
 
-    $segments = $Pattern -split '\\'
-    $dirs     = @($base)
-    $recurse  = $false
-    foreach ($seg in ($segments | Select-Object -SkipLast 1)) {
-        if     ($seg -eq '**')      { $recurse = $true }
-        elseif ($seg -match '[*?]') { $dirs = @(foreach ($d in $dirs) { Get-ChildDirectory -Path (Get-ListPath -Path $d) -Filter $seg }) }
-        else {
-            $dirs = @(foreach ($d in $dirs) {
-                $next = Get-DiskCasePath -Path ($d + '\' + $seg)
-                if (-not (Test-FolderLink -Path $next)) { $next }
+    $segments    = $Pattern -split '\\'
+    $folderPaths = @($base)
+    $recurse     = $false
+    foreach ($segment in ($segments | Select-Object -SkipLast 1)) {
+        if ($segment -eq '**') {
+            $recurse = $true
+        } elseif ($segment -match '[*?]') {
+            $folderPaths = @(foreach ($folderPath in $folderPaths) {
+                Get-ChildFolder -Path (ConvertTo-ListablePath -Path $folderPath) -Filter $segment -FoldersNotListed $FoldersNotListed
+            })
+        } else {
+            $folderPaths = @(foreach ($folderPath in $folderPaths) {
+                $nextPath = Get-OnDiskCasePath -Path ($folderPath + '\' + $segment)
+                if (-not (Test-FolderPathIsLink -Path $nextPath)) { $nextPath }
             })
         }
     }
-    if ($recurse) { $dirs = @(foreach ($d in $dirs) { Get-DirectoryTree -Path $d }) }
-    foreach ($d in $dirs) {
-        if (Test-NormalisedName -Path $d) {
-            Get-ExtendedChildPath -Path $d -Filter $segments[-1]
-            continue
-        }
-        $listingErrors = $null
-        try {
-            Get-ChildItem -LiteralPath (Get-ListPath -Path $d) -Filter $segments[-1] -File -Force -ErrorAction SilentlyContinue -ErrorVariable listingErrors |
-                ForEach-Object { $_.FullName }
-        } catch { $listingErrors = @($_) }
-        Add-ListingFailure -Path $d -ErrorRecords $listingErrors
+    if ($recurse) {
+        $folderPaths = @(foreach ($folderPath in $folderPaths) { Get-FolderTree -Path $folderPath -FoldersNotListed $FoldersNotListed })
+    }
+    foreach ($folderPath in $folderPaths) {
+        Get-ChildFile -Path $folderPath -Filter $segments[-1] -FoldersNotListed $FoldersNotListed
     }
 }
 
-# --- Registry ---
+# --- Registry and host facts ---
 
 # A registry value with environment variables expanded, or $null if the key or
 # value is absent or unreadable.
@@ -654,66 +782,92 @@ function Get-RegistryValue {
     param([string]$Path, [string]$Name)
     try {
         $value = (Get-ItemProperty -LiteralPath $Path -Name $Name -ErrorAction Stop).$Name
-        if ($value) { [Environment]::ExpandEnvironmentVariables($value) }
-    } catch {}
+        if ($value) { return [Environment]::ExpandEnvironmentVariables($value) }
+    } catch { return $null }
+    return $null
 }
 
-# Facts about the host for the OS line and the summary notes. The
-# name and type come from CIM (Win32_OperatingSystem's caption is right for
-# Windows 11) and the release (e.g. 23H2) from the registry; if CIM fails, the
-# registry alone, correcting its ProductName, which still says "Windows 10" on
-# Windows 11. Decisions use the build number and the server/workstation type,
-# never the name, which is localised. A fact that can't be determined stays
-# $null, and conditions treat $null as "not expected".
+# Facts about the host for the OS line and the summary notes. The name and type
+# come from CIM (Win32_OperatingSystem's caption is right for Windows 11) and
+# the release (e.g. 23H2) from the registry; if CIM fails, the registry alone,
+# correcting its ProductName, which still says "Windows 10" on Windows 11.
+# Decisions use the build number and the server/workstation type, never the
+# name, which is localised. A fact that can't be determined stays $null, and
+# conditions treat $null as "not expected".
 function Get-HostInfo {
-    $cv   = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion'
-    $info = @{ Caption = $null; Version = $null; Build = $null
-               Server = $null; DomainJoined = $null }
+    $currentVersionKey = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion'
+    $info = @{ Caption = $null; Version = $null; Build = $null; Server = $null; DomainJoined = $null }
     try {
-        $os = Get-CimInstance -ClassName Win32_OperatingSystem -ErrorAction Stop
-        $info.Caption = $os.Caption.Trim()
-        $info.Build   = [int]$os.BuildNumber
-        $info.Server  = ($os.ProductType -ne 1)   # 1 = workstation, 2 = DC, 3 = server
-    } catch {}
-    try { $info.DomainJoined = [bool](Get-CimInstance -ClassName Win32_ComputerSystem -ErrorAction Stop).PartOfDomain } catch {}
+        $operatingSystem = Get-CimInstance -ClassName Win32_OperatingSystem -ErrorAction Stop
+        $info.Caption = $operatingSystem.Caption.Trim()
+        $info.Build   = [int]$operatingSystem.BuildNumber
+        $info.Server  = ($operatingSystem.ProductType -ne 1)   # 1 = workstation, 2 = DC, 3 = server
+    } catch {}   # no CIM: the registry below
     try {
-        $reg = Get-ItemProperty -LiteralPath $cv -ErrorAction Stop
-        $info.Version = if ($reg.DisplayVersion) { $reg.DisplayVersion } else { $reg.ReleaseId }
-        if (-not $info.Build)  { $info.Build = [int]$reg.CurrentBuild }
-        if ($null -eq $info.Server -and $reg.InstallationType) { $info.Server = ($reg.InstallationType -notlike 'Client*') }
-        if (-not $info.Caption -and $reg.ProductName) {
-            $info.Caption = $reg.ProductName
+        $info.DomainJoined = [bool](Get-CimInstance -ClassName Win32_ComputerSystem -ErrorAction Stop).PartOfDomain
+    } catch {}   # stays unknown
+    try {
+        $currentVersion = Get-ItemProperty -LiteralPath $currentVersionKey -ErrorAction Stop
+        $info.Version = if ($currentVersion.DisplayVersion) { $currentVersion.DisplayVersion } else { $currentVersion.ReleaseId }
+        if (-not $info.Build) { $info.Build = [int]$currentVersion.CurrentBuild }
+        if ($null -eq $info.Server -and $currentVersion.InstallationType) { $info.Server = ($currentVersion.InstallationType -notlike 'Client*') }
+        if (-not $info.Caption -and $currentVersion.ProductName) {
+            $info.Caption = $currentVersion.ProductName
             if ($info.Build -ge 22000) { $info.Caption = $info.Caption -replace 'Windows 10', 'Windows 11' }
         }
-    } catch {}
-    $info
+    } catch {}   # no registry: the CIM facts stand
+    return $info
 }
 
-# True if a row's expectation condition (a scriptblock using $hostInfo) holds.
-# Missing or failing conditions count as "not expected".
-function Test-Expectation {
+# True if a row's condition (a scriptblock over $hostInfo) holds. A missing or
+# failing condition counts as "not expected".
+function Test-HostCondition {
     param($Condition)
     if (-not $Condition) { return $false }
     try { return [bool](& $Condition) } catch { return $false }
 }
 
 # The Why of the first ExpectMissing rule whose When holds, or $null if none does.
-function Get-ExpectedReason {
+function Get-ExpectedMissingReason {
     param($Rules)
-    foreach ($r in @($Rules)) {
-        if ($r -and (Test-Expectation -Condition $r.When)) { return $r.Why }
+    foreach ($rule in @($Rules)) {
+        if ($rule -and (Test-HostCondition -Condition $rule.When)) { return $rule.Why }
     }
     return $null
 }
 
-# Drive roots ('C:', 'D:') for a row's Volumes (see the artefact table): the
-# system drive only by default, every ready local drive ('All'), or those
-# formatted NTFS ('NTFS'). The system drive always comes first.
-function Get-VolumeRoot {
+# --- Drives and profiles ---
+
+# Every ready local drive, for per-drive artefacts: fixed and removable alike,
+# with its file system; network drives and drives that aren't ready (no media,
+# locked) are left out. The system drive is always present and comes first.
+function Get-LocalDrive {
+    $drives = New-Object 'System.Collections.Generic.List[object]'
+    try {
+        foreach ($driveInfo in [System.IO.DriveInfo]::GetDrives()) {
+            try {
+                if ($driveInfo.DriveType -eq [System.IO.DriveType]::Network -or
+                    $driveInfo.DriveType -eq [System.IO.DriveType]::NoRootDirectory) { continue }
+                if ($driveInfo.IsReady) {
+                    $drives.Add([pscustomobject]@{ Root = $driveInfo.Name.TrimEnd('\'); Format = $driveInfo.DriveFormat })
+                }
+            } catch { continue }   # a drive that can't be read is skipped (best effort)
+        }
+    } catch { $drives.Clear() }   # no drive list at all: the system drive alone, below
+    if (-not ($drives | Where-Object { $_.Root -eq $systemDrive })) {
+        $drives.Insert(0, [pscustomobject]@{ Root = $systemDrive; Format = 'NTFS' })   # never lose the system drive
+    }
+    return @($drives | Sort-Object -Property { $_.Root -ne $systemDrive }, Root)
+}
+
+# Drive roots ('C:', 'D:') for a row's Drives field: the system drive only by
+# default, every local drive ('All'), or those formatted NTFS ('NTFS'), from
+# $script:localDrives. The system drive always comes first.
+function Get-DriveRoot {
     param([string]$Kind = 'System')
-    if ($Kind -ne 'All' -and $Kind -ne 'NTFS') { return $sysDrive }
-    foreach ($v in $script:volumes) {
-        if ($Kind -eq 'All' -or $v.Format -eq 'NTFS') { $v.Root }
+    if ($Kind -ne 'All' -and $Kind -ne 'NTFS') { return $systemDrive }
+    foreach ($drive in $script:localDrives) {
+        if ($Kind -eq 'All' -or $drive.Format -eq 'NTFS') { $drive.Root }
     }
 }
 
@@ -721,24 +875,26 @@ function Get-VolumeRoot {
 # (deliberately not the registry's ProfileList). A root that is itself a link
 # (Documents and Settings -> Users on current Windows) is resolved to its target,
 # and only if that can be read and stays on the system drive, so no profile is
-# listed twice.
-# Links inside a root ("All Users", "Default User") are skipped by
-# Get-ChildDirectory. Service accounts are not profiles: rows list their paths.
+# listed twice. Links inside a root ("All Users", "Default User") are skipped by
+# Get-ChildFolder. Service accounts are not profiles: rows list their paths.
 function Get-UserProfilePath {
-    $seen = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
-    foreach ($r in $profileRoots) {
+    param([System.Collections.Generic.List[object]]$FoldersNotListed)
+    $seenRoots = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+    foreach ($rootName in $profileRoots) {
         try {
-            $root = (Join-Path $sysDrive $r)
-            $item = Get-Item -LiteralPath $root -Force -ErrorAction Stop
-            if (Test-LinkItem -Item $item) {
+            $rootPath = Join-Path $systemDrive $rootName
+            $rootItem = Get-Item -LiteralPath $rootPath -Force -ErrorAction Stop
+            if (Test-FolderItemIsLink -Item $rootItem) {
                 # A link whose target can't be read (Windows' compatibility link
                 # behind its deny-list) or that leaves the drive is skipped.
-                $target = @($item.Target)[0]
-                if (-not $target -or $target -notlike "$sysDrive\*") { continue }
-                $root = $target
+                $target = Get-LinkTarget -Item $rootItem
+                if (-not $target -or $target -notlike "$systemDrive\*") { continue }
+                $rootPath = $target
             }
-            if ($seen.Add($root.TrimEnd('\'))) { Get-ChildDirectory -Path $root }
-        } catch {}
+            if ($seenRoots.Add($rootPath.TrimEnd('\'))) {
+                Get-ChildFolder -Path $rootPath -FoldersNotListed $FoldersNotListed
+            }
+        } catch { continue }   # no such root (e.g. no Documents and Settings): nothing to list
     }
 }
 
@@ -746,15 +902,15 @@ function Get-UserProfilePath {
 # own depth (its folder segments before any '**'), counted from Root. E.g. the
 # browser profile folder for 'User Data\*\History*', or the History folder for
 # 'History\**\index.dat', however deep the file itself is.
-function Get-PatternUnit {
+function Get-CountByFolderPath {
     param([string]$Root, [string]$Pattern, [string]$Path)
-    $folders = @($Pattern -split '\\' | Select-Object -SkipLast 1)
-    $depth   = [array]::IndexOf($folders, '**')
-    if ($depth -lt 0) { $depth = $folders.Count }
+    $folderSegments = @($Pattern -split '\\' | Select-Object -SkipLast 1)
+    $depth = [array]::IndexOf($folderSegments, '**')
+    if ($depth -lt 0) { $depth = $folderSegments.Count }
     $base = $Root.TrimEnd('\')
     if ($depth -eq 0) { return $base }
-    $parts = @($Path.Substring($base.Length + 1) -split '\\')
-    return $base + '\' + (($parts | Select-Object -First $depth) -join '\')
+    $pathSegments = @($Path.Substring($base.Length + 1) -split '\\')
+    return $base + '\' + (($pathSegments | Select-Object -First $depth) -join '\')
 }
 
 # --- Zip ---
@@ -763,265 +919,428 @@ function Get-PatternUnit {
 # ERROR_HANDLE_DISK_FULL), i.e. the zip can't grow - as opposed to a locked file.
 function Test-DiskFull {
     param($ErrorRecord)
-    $e = $ErrorRecord.Exception
-    while ($e) {
-        if (($e.HResult -band 0xFFFF) -in 39, 112) { return $true }
-        $e = $e.InnerException
+    $exception = $ErrorRecord.Exception
+    while ($exception) {
+        if (($exception.HResult -band 0xFFFF) -in 39, 112) { return $true }
+        $exception = $exception.InnerException
     }
     return $false
 }
 
+# The zip entry name for a file path: C:\Users\bob\file.lnk -> C/Users/bob/file.lnk
+function ConvertTo-ZipEntryName {
+    param([string]$Path)
+    return (($Path -replace '^([A-Za-z]):', '$1') -replace '\\', '/')
+}
+
+# Lower-case hex of a finished hasher's digest.
+function ConvertTo-HexDigest {
+    param($Hasher)
+    return (($Hasher.Hash | ForEach-Object { $_.ToString('x2') }) -join '')
+}
+
+# A file's own created, modified and accessed times (UTC), from the file
+# system's record of the file itself (GetFileAttributesEx, through \\?\ as for
+# the open), not from the folder listing's copy, which NTFS updates lazily
+# (round 2: the listing's last-access lagged the file's own). Read just before
+# the open, which doesn't happen here: opening and reading the file move its
+# last-access time. Returns @{ Created; Modified; Accessed }, $null for any
+# time that can't be read.
+function Get-FileOwnTime {
+    param([string]$Path)
+    $times = @{ Created = $null; Modified = $null; Accessed = $null }
+    try {
+        try {
+            $file = [System.IO.FileInfo]::new('\\?\' + $Path)
+        } catch [System.NotSupportedException], [System.ArgumentException] {
+            # .NET Framework before 4.6.2 refuses \\?\ paths: as in Copy-FileToZip,
+            # the plain path only if it names the same file.
+            if (Test-NameEndsInDotOrSpace -Path $Path) { return $times }
+            $file = [System.IO.FileInfo]::new($Path)
+        }
+        $file.Refresh()
+        # A FileInfo for a file that is gone reports 1601-01-01, not an error.
+        if (-not $file.Exists) { return $times }
+        $times.Created  = $file.CreationTimeUtc
+        $times.Modified = $file.LastWriteTimeUtc
+        $times.Accessed = $file.LastAccessTimeUtc
+    } catch {}   # times that can't be read stay unknown
+    return $times
+}
+
 # Copy one file straight into the zip, opening it with shared access so files
 # held open by other processes (e.g. Edge History) can usually still be read.
-# Returns $true (copied), $false (found but unreadable) or $null (already in zip).
-# Two side effects, both recorded for the end of the run:
-# - if the system drive fills up, it sets $script:diskFull so collection stops;
-# - if the bytes copied differ from the source's size when it was opened (a live
-#   file that changed, or a read that failed part-way, which leaves an
-#   incomplete entry in the zip, as Create mode can't remove one), it adds the
-#   file to $script:sizeDifferences (Path, Copied, SizeWhenOpened, ReadError).
-function Add-FileToZip {
-    param($Zip, [string]$Path)
+# The bytes are hashed as they are copied. LastWriteTimeUtc is the file's own
+# modified time read before the open (Get-FileOwnTime), for the entry's time;
+# $null to read it now (a Literal path).
+# Returns @{ Outcome; SizeWhenOpened; BytesCopied; Sha256; Error; DiskFull }:
+#   Outcome  'collected' (every byte of the size when opened),
+#            'size changed' (collected, but a live file grew or shrank meanwhile),
+#            'incomplete' (the read failed part-way: the entry stays in the zip,
+#            incomplete, as Create mode can't remove one) or
+#            'not accessible' (the file could not be opened).
+#   DiskFull $true when the zip can't grow: collection must stop.
+function Copy-FileToZip {
+    param($Zip, [string]$Path, [string]$EntryName, $LastWriteTimeUtc)
 
-    # C:\Users\bob\file.lnk -> C/Users/bob/file.lnk
-    $entryName = ($Path -replace '^([A-Za-z]):', '$1') -replace '\\', '/'
-    if (-not $script:added.Add($entryName)) { return $null }
-
-    $src = $null
-    $dst = $null
-    $entryCreated   = $false
-    $copied         = [long]0
-    $sizeWhenOpened = $null
+    $result = @{ Outcome = 'not accessible'; SizeWhenOpened = $null; BytesCopied = [long]0; Sha256 = ''; Error = ''; DiskFull = $false }
+    $source       = $null
+    $destination  = $null
+    $entryCreated = $false
+    $hasher       = $null
     # Opened through \\?\ always: .NET normalises a plain path, dropping a trailing
     # dot or space (report. would open report, another file) and limiting it to
     # 260 characters.
     $openPath = '\\?\' + $Path
     try {
         try {
-            $src = [System.IO.File]::Open($openPath, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]'ReadWrite, Delete')
+            $source = [System.IO.File]::Open($openPath, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]'ReadWrite, Delete')
         } catch [System.NotSupportedException], [System.ArgumentException] {
             # .NET Framework before 4.6.2 refuses \\?\ paths. A plain path is safe
             # only if no name in it ends with a dot or a space; otherwise it would
             # open another file, so this one counts as not accessible.
-            if (Test-NormalisedName -Path $Path) { throw }
+            if (Test-NameEndsInDotOrSpace -Path $Path) { throw }
             $openPath = $Path
-            $src = [System.IO.File]::Open($openPath, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]'ReadWrite, Delete')
+            $source = [System.IO.File]::Open($openPath, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]'ReadWrite, Delete')
         }
-        try { $sizeWhenOpened = $src.Length } catch {}
-        $entry = $Zip.CreateEntry($entryName, [System.IO.Compression.CompressionLevel]::Fastest)
-        $entryCreated = $true
+        try { $result.SizeWhenOpened = $source.Length } catch {}   # stays unknown
         # UTC: zip stores a zone-less date/time, so keep it in the always-UTC convention.
-        try { $entry.LastWriteTime = [System.IO.File]::GetLastWriteTimeUtc($openPath) } catch {}
-        $dst = $entry.Open()
-        # Copied by hand rather than with CopyTo, to count the bytes.
-        while (($read = $src.Read($script:copyBuffer, 0, $script:copyBuffer.Length)) -gt 0) {
-            $dst.Write($script:copyBuffer, 0, $read)
-            $copied += $read
+        $entryTime = $null
+        try {
+            $entryTime = if ($null -ne $LastWriteTimeUtc) { $LastWriteTimeUtc } else { [System.IO.File]::GetLastWriteTimeUtc($openPath) }
+        } catch {}   # the entry keeps the zip's default time
+        $entry = $Zip.CreateEntry($EntryName, [System.IO.Compression.CompressionLevel]::Fastest)
+        $entryCreated = $true
+        if ($null -ne $entryTime) {
+            try { $entry.LastWriteTime = $entryTime } catch {}   # a time the zip format can't hold (before 1980): the default stays
         }
-        $script:count++
-        if ($null -ne $sizeWhenOpened -and $copied -ne $sizeWhenOpened) {
-            $script:sizeDifferences.Add([pscustomobject]@{ Path = $Path; Copied = $copied; SizeWhenOpened = $sizeWhenOpened; ReadError = $null })
+        $destination = $entry.Open()
+        $hasher = [System.Security.Cryptography.SHA256]::Create()
+        while (($bytesRead = $source.Read($script:copyBuffer, 0, $script:copyBuffer.Length)) -gt 0) {
+            $destination.Write($script:copyBuffer, 0, $bytesRead)
+            $null = $hasher.TransformBlock($script:copyBuffer, 0, $bytesRead, $null, 0)
+            $result.BytesCopied += $bytesRead
         }
-        return $true
+        $null = $hasher.TransformFinalBlock($script:copyBuffer, 0, 0)
+        $result.Sha256  = ConvertTo-HexDigest -Hasher $hasher
+        $result.Outcome = if ($null -ne $result.SizeWhenOpened -and $result.BytesCopied -ne $result.SizeWhenOpened) { 'size changed' } else { 'collected' }
     } catch {
+        $result.Error = Get-OneLineMessage -ErrorRecord $_
         if (Test-DiskFull -ErrorRecord $_) {
-            $script:diskFull = $true
+            $result.DiskFull = $true
         } elseif ($entryCreated) {
-            # The entry stays in the zip, incomplete: say so.
-            $script:sizeDifferences.Add([pscustomobject]@{ Path = $Path; Copied = $copied; SizeWhenOpened = $sizeWhenOpened; ReadError = (Get-OneLineMessage -ErrorRecord $_) })
+            $result.Outcome = 'incomplete'
+            # The hash of what the entry holds, so the record still describes it.
+            if ($hasher) { try { $null = $hasher.TransformFinalBlock($script:copyBuffer, 0, 0); $result.Sha256 = ConvertTo-HexDigest -Hasher $hasher } catch {} }   # no hash then
         }
-        return $false   # locked / access denied, a read that failed part-way (or disk full: see above)
     } finally {
         # Closing can fail too (e.g. disk full while flushing the entry): never let it escape.
-        if ($dst) { try { $dst.Dispose() } catch {} }
-        if ($src) { try { $src.Dispose() } catch {} }
+        if ($destination) { try { $destination.Dispose() } catch {} }
+        if ($source)      { try { $source.Dispose() } catch {} }
+        if ($hasher)      { try { $hasher.Dispose() } catch {} }
+    }
+    return $result
+}
+
+# --- The per-file record (collection.csv) ---
+
+# One collection.csv line for a file attempted or a folder not listed (columns:
+# $fileRecordColumns).
+# FileTimes is Get-FileOwnTime's result, or $null for a file never listed.
+function New-FileRecordLine {
+    param([string]$Artefact, [string]$Outcome, [string]$Source, [string]$Entry, $Size, $BytesCopied, [string]$Sha256, $FileTimes, [string]$Detail)
+    $created = ''; $modified = ''; $accessed = ''
+    if ($FileTimes) {
+        $created  = Format-RecordTime -DateTimeUtc $FileTimes.Created
+        $modified = Format-RecordTime -DateTimeUtc $FileTimes.Modified
+        $accessed = Format-RecordTime -DateTimeUtc $FileTimes.Accessed
+    }
+    $sizeText        = if ($null -ne $Size) { [string]$Size } else { '' }
+    $bytesCopiedText = if ($null -ne $BytesCopied) { [string]$BytesCopied } else { '' }
+    return (ConvertTo-CsvLine -Cells @($Artefact, $Outcome, $Source, $Entry, $sizeText, $bytesCopiedText, $Sha256, $created, $modified, $accessed, $Detail))
+}
+
+# Write collection.csv into the zip (UTF-8 without BOM, CRLF), as its last
+# entry. Throws if the zip can't take it (the caller treats that as disk full).
+function Write-FileRecord {
+    param($Zip, [string]$EntryName, [string[]]$Lines)
+    $entryStream = $null
+    $writer      = $null
+    try {
+        $entry = $Zip.CreateEntry($EntryName, [System.IO.Compression.CompressionLevel]::Optimal)
+        $entry.LastWriteTime = [DateTime]::UtcNow
+        $entryStream = $entry.Open()
+        $writer = New-Object System.IO.StreamWriter($entryStream, $script:utf8NoBom)
+        $writer.NewLine = "`r`n"
+        $writer.WriteLine((ConvertTo-CsvLine -Cells $fileRecordColumns))
+        foreach ($line in $Lines) { $writer.WriteLine($line) }
+        $writer.Flush()
+    } finally {
+        if ($writer)      { try { $writer.Dispose() } catch {} }
+        if ($entryStream) { try { $entryStream.Dispose() } catch {} }
     }
 }
 
-# --- Output and run log ---
-
-# Print a line and keep it in the run log beside the zip. Until the output folder
-# is known the lines are buffered, then written out in one go (see MAIN). A log
-# that can't be written never affects the run.
-function Write-Line {
-    param([string]$Text = '')
-    Write-Output $Text
-    if ($script:logPath) {
-        try { [System.IO.File]::AppendAllText($script:logPath, $Text + "`r`n", $script:logEncoding) } catch {}
-    } else {
-        $script:logLines.Add($Text)
-    }
-}
-
-# --- Progress, collection, summary ---
-
-# Rough progress: print "[n/total] Collecting <artefact>" as each artefact starts,
-# so an operator sees movement on a slow/busy host. No counts - just a heartbeat.
-function Write-Stage {
-    param([string]$Name)
-    $script:stageNum++
-    Write-Line -Text ("[{0:D2}/{1}] Collecting {2}" -f $script:stageNum, $script:stageTotal, $Name)
-}
+# --- Collecting one artefact ---
 
 # Tally -> status string:
 #   no candidates -> Missing; none read -> Not accessible; else "N collected[, M not accessible]"
-function Format-Status {
+function Format-SummaryStatus {
     param([int]$Candidates, [int]$Collected, [int]$Failed)
-    if     ($Candidates -eq 0) { 'Missing' }
-    elseif ($Collected -eq 0)  { 'Not accessible' }
-    elseif ($Failed -gt 0)     { "$Collected collected, $Failed not accessible" }
-    else                       { "$Collected collected" }
+    if     ($Candidates -eq 0) { return 'Missing' }
+    elseif ($Collected -eq 0)  { return 'Not accessible' }
+    elseif ($Failed -gt 0)     { return "$Collected collected, $Failed not accessible" }
+    else                       { return "$Collected collected" }
 }
 
-# Collect one artefact row: resolve its patterns (system drive, then each user
-# profile), stream every match into the zip as it is found, and set the row's one
-# summary line. Each location is isolated: a failure skips only that location.
-function Add-Artefact {
-    param($Zip, [hashtable]$Artefact, [string[]]$UserProfile)
-
-    Write-Stage -Name $Artefact.Name
-    $tally = @{ Candidates = 0; Collected = 0; Failed = 0 }
-    $units = @{}   # CountBy 'Folder': folder -> $true once any file in it was read
-
-    $sources = @()
-    foreach ($root in (Get-VolumeRoot -Kind $Artefact.Volumes)) {
-        foreach ($p in $Artefact.System) { $sources += @{ Root = $root; Scope = 'System'; Pattern = $p } }
+# The places one artefact row is searched: @{ Root; Scope; Pattern } for each
+# drive root and System pattern, each registry-named folder, and each user
+# profile and User pattern.
+function Get-ArtefactSource {
+    param([hashtable]$Artefact, [string[]]$UserProfilePaths)
+    foreach ($driveRoot in (Get-DriveRoot -Kind $Artefact.Drives)) {
+        foreach ($pattern in $Artefact.System) { @{ Root = $driveRoot; Scope = 'System'; Pattern = $pattern } }
     }
-    foreach ($rd in $Artefact.RegDirs) {
-        $dir = Get-RegistryValue -Path $rd.Key -Name $rd.Value
-        # Absolute local drive paths only (any letter): skips shares and relative paths.
-        # Also skips the root of the system drive ($sysDrive, from %SystemDrive%), as a
-        # recursive search would walk the whole drive; another drive's root is fine -
-        # small partitions are sometimes set aside for transcripts.
-        if ($dir -match '^[A-Za-z]:\\' -and $dir.TrimEnd('\') -ne $sysDrive) {
-            $sources += @{ Root = $dir; Scope = 'System'; Pattern = $rd.Pattern }
+    foreach ($registryFolder in $Artefact.RegistryFolders) {
+        $folderPath = Get-RegistryValue -Path $registryFolder.Key -Name $registryFolder.Value
+        # Absolute local drive paths only (any letter): skips shares and relative
+        # paths. Also skips the root of the system drive, as a recursive search
+        # would walk the whole drive; another drive's root is fine - small
+        # partitions are sometimes set aside for transcripts.
+        if ($folderPath -match '^[A-Za-z]:\\' -and $folderPath.TrimEnd('\') -ne $systemDrive) {
+            @{ Root = $folderPath; Scope = 'System'; Pattern = $registryFolder.Pattern }
         }
     }
-    foreach ($u in $UserProfile) {
-        foreach ($p in $Artefact.User) { $sources += @{ Root = $u; Scope = 'User'; Pattern = $p } }
+    foreach ($profilePath in $UserProfilePaths) {
+        foreach ($pattern in $Artefact.User) { @{ Root = $profilePath; Scope = 'User'; Pattern = $pattern } }
     }
+}
 
-    # Folders this row's patterns couldn't list (see Add-ListingFailure), and
-    # this row's copies that failed part-way: both always make the row an
-    # unusual gap, even where a note would otherwise explain a lock.
-    $unlistedFolders = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
-    $partialCopiesBefore = @($script:sizeDifferences | Where-Object { $_.ReadError }).Count
+# Collect one artefact row: resolve its patterns in every source, stream every
+# match into the zip as it is found, and work out the row's summary line. Each
+# source is isolated: a failure there skips only that source.
+# Returns the row's result:
+#   Status, Note          the summary line and its note ('' if none)
+#   IsUnusualGap          whether the row belongs under "Unusual gaps"
+#   UnreadableFiles       files found but not read: Path, Scope, Literal, GetFile,
+#                         FollowUp, IsTransactionLog (for the getfile follow-ups)
+#   FoldersNotListed      Path, Reason
+#   SizeDifferences       Path, BytesCopied, SizeWhenOpened, ReadError
+#   FileRecordLines       the row's collection.csv lines
+#   CollectedFileCount    files written whole (or as a live file changed)
+#   DiskFull              $true if the zip filled up while collecting this row
+function Add-ArtefactToZip {
+    param($Zip, [hashtable]$Artefact, [string[]]$UserProfilePaths)
 
-    :sources foreach ($s in $sources) {
+    $tally = @{ Candidates = 0; Collected = 0; Failed = 0 }
+    $countByFolderUnits = @{}   # CountBy 'Folder': folder -> @{ Main; Any } (whether its main / any file was read)
+    $unreadableFiles  = New-Object 'System.Collections.Generic.List[object]'
+    $foldersNotListed = New-Object 'System.Collections.Generic.List[object]'
+    $sizeDifferences  = New-Object 'System.Collections.Generic.List[object]'
+    $fileRecordLines  = New-Object 'System.Collections.Generic.List[string]'
+    $partialCopyCount   = 0
+    $collectedFileCount = 0
+    $diskFull           = $false
+    $followUpScope    = if ($Artefact.FollowUp) { $Artefact.FollowUp } else { 'System' }
+
+    :sources foreach ($source in (Get-ArtefactSource -Artefact $Artefact -UserProfilePaths $UserProfilePaths)) {
         try {
-            $patterns = @($s.Pattern)
-            if ($Artefact.Logs) { $patterns += $s.Pattern + '.LOG*' }   # hive first, then its logs
+            # The hive first, then its transaction logs (marked, so the follow-ups skip them).
+            $patterns = @(@{ Text = $source.Pattern; IsTransactionLog = $false })
+            if ($Artefact.TransactionLogs) { $patterns += @{ Text = ($source.Pattern + '.LOG*'); IsTransactionLog = $true } }
             foreach ($pattern in $patterns) {
-                $failuresBefore = $script:listingFailures.Count
-                $matchedFiles = @(Resolve-PathPattern -Root $s.Root -Pattern $pattern -Literal:([bool]$Artefact.Literal))
-                for ($i = $failuresBefore; $i -lt $script:listingFailures.Count; $i++) {
-                    [void]$unlistedFolders.Add($script:listingFailures[$i].Path)
-                }
-                foreach ($file in $matchedFiles) {
-                    $ok = Add-FileToZip -Zip $Zip -Path $file
-                    if ($script:diskFull) { $script:diskFullAt = $Artefact.Name; break sources }   # zip can't grow: stop
-                    if ($null -eq $ok) { continue }   # already collected
-                    if (-not $ok) {
-                        $script:failed.Add([pscustomobject]@{
-                            Path = $file; Scope = $s.Scope
+                $matchedFiles = @(Resolve-PathPattern -Root $source.Root -Pattern $pattern.Text -Literal:([bool]$Artefact.Literal) -FoldersNotListed $foldersNotListed)
+                foreach ($matchedFile in $matchedFiles) {
+                    # Empty files and file symbolic links are left out entirely:
+                    # not read, not counted, not recorded.
+                    if ($matchedFile.Item -and $matchedFile.Item.Length -eq 0) { continue }
+                    if ($matchedFile.Item -and (Test-FileItemIsSymbolicLink -Item $matchedFile.Item)) { continue }
+                    $entryName = ConvertTo-ZipEntryName -Path $matchedFile.Path
+                    if (-not $script:zipEntryNames.Add($entryName)) { continue }   # the same file, matched by an earlier pattern
+                    # The file's own times, read before the open moves its last-access time.
+                    $fileTimes        = $null
+                    $lastWriteTimeUtc = $null
+                    if ($matchedFile.Item) {
+                        $fileTimes        = Get-FileOwnTime -Path $matchedFile.Path
+                        $lastWriteTimeUtc = $fileTimes.Modified
+                    }
+                    $copy = Copy-FileToZip -Zip $Zip -Path $matchedFile.Path -EntryName $entryName -LastWriteTimeUtc $lastWriteTimeUtc
+                    if ($copy.DiskFull) { $diskFull = $true; break sources }   # the zip can't grow: stop
+                    $wasRead   = ($copy.Outcome -eq 'collected' -or $copy.Outcome -eq 'size changed')
+                    if ($wasRead) { $collectedFileCount++ }
+                    $entryText = if ($copy.Outcome -eq 'not accessible') { '' } else { $entryName }
+                    $fileRecordLines.Add((New-FileRecordLine -Artefact $Artefact.Name -Outcome $copy.Outcome -Source $matchedFile.Path -Entry $entryText -Size $copy.SizeWhenOpened -BytesCopied $copy.BytesCopied -Sha256 $copy.Sha256 -FileTimes $fileTimes -Detail $copy.Error))
+                    if ($copy.Outcome -eq 'size changed' -or $copy.Outcome -eq 'incomplete') {
+                        $readError = if ($copy.Outcome -eq 'incomplete') { $copy.Error } else { '' }
+                        $sizeDifferences.Add([pscustomobject]@{ Path = $matchedFile.Path; BytesCopied = $copy.BytesCopied; SizeWhenOpened = $copy.SizeWhenOpened; ReadError = $readError })
+                        if ($copy.Outcome -eq 'incomplete') { $partialCopyCount++ }
+                    }
+                    if (-not $wasRead) {
+                        $unreadableFiles.Add([pscustomobject]@{
+                            Path = $matchedFile.Path; Scope = $source.Scope
                             Literal = [bool]$Artefact.Literal; GetFile = [bool]$Artefact.GetFile
-                            FollowUp = $(if ($Artefact.FollowUp) { $Artefact.FollowUp } else { 'System' })
+                            FollowUp = $followUpScope; IsTransactionLog = $pattern.IsTransactionLog
                         })
                     }
                     if ($Artefact.CountBy -eq 'Folder') {
-                        $unit = Get-PatternUnit -Root $s.Root -Pattern $pattern -Path $file
-                        if (-not $units.ContainsKey($unit)) { $units[$unit] = @{ Main = $null; Any = $false } }
-                        $leaf = Split-Path -Path $file -Leaf
-                        if (@($Artefact.Supporting | Where-Object { $leaf -like $_ }).Count -gt 0) {
-                            $units[$unit].Any = $units[$unit].Any -or $ok
+                        $unitPath = Get-CountByFolderPath -Root $source.Root -Pattern $pattern.Text -Path $matchedFile.Path
+                        if (-not $countByFolderUnits.ContainsKey($unitPath)) { $countByFolderUnits[$unitPath] = @{ Main = $null; Any = $false } }
+                        $fileName = Split-Path -Path $matchedFile.Path -Leaf
+                        if (@($Artefact.SupportingFiles | Where-Object { $fileName -like $_ }).Count -gt 0) {
+                            $countByFolderUnits[$unitPath].Any = $countByFolderUnits[$unitPath].Any -or $wasRead
                         } else {
-                            $units[$unit].Main = ($units[$unit].Main -eq $true) -or $ok
+                            $countByFolderUnits[$unitPath].Main = ($countByFolderUnits[$unitPath].Main -eq $true) -or $wasRead
                         }
                     } else {
                         $tally.Candidates++
-                        if ($ok) { $tally.Collected++ } else { $tally.Failed++ }
+                        if ($wasRead) { $tally.Collected++ } else { $tally.Failed++ }
                     }
                 }
             }
-        } catch {}
+        } catch {
+            # A source that failed as a whole (its root unreadable in a way the
+            # listings didn't record) counts as one folder not listed.
+            $foldersNotListed.Add([pscustomobject]@{ Path = $source.Root; Reason = (Get-OneLineMessage -ErrorRecord $_) })
+        }
     }
 
     if ($Artefact.CountBy -eq 'Folder') {
         # Collected if the main file was read; supporting files only decide when a
         # unit has no main file at all (e.g. a lone journal).
-        $tally.Candidates = $units.Count
-        $tally.Collected  = @($units.Values | Where-Object { $_.Main -eq $true -or ($null -eq $_.Main -and $_.Any) }).Count
+        $tally.Candidates = $countByFolderUnits.Count
+        $tally.Collected  = @($countByFolderUnits.Values | Where-Object { $_.Main -eq $true -or ($null -eq $_.Main -and $_.Any) }).Count
         $tally.Failed     = $tally.Candidates - $tally.Collected
     }
-    # Each folder that couldn't be listed counts as one item not accessible.
-    $tally.Candidates += $unlistedFolders.Count
-    $tally.Failed     += $unlistedFolders.Count
-    $partialCopies = @($script:sizeDifferences | Where-Object { $_.ReadError }).Count - $partialCopiesBefore
-    $status = Format-Status @tally
-    $script:summary[$Artefact.Name] = $status
-    $reason = if ($status -eq 'Missing') { Get-ExpectedReason -Rules $Artefact.ExpectMissing } else { $null }
-    if ($reason) {
-        $script:notes[$Artefact.Name] = "($reason)"
-    } elseif ($status -like '*not accessible*' -and (Test-Expectation -Condition $Artefact.ExpectLocked)) {
-        $requires = if ($Artefact.Requires) { $Artefact.Requires } else { 'NTFS parser' }
-        $script:notes[$Artefact.Name] = "(requires $requires)"
+    # Each folder that couldn't be listed counts as one item not accessible,
+    # and has its own row in the record, so the count can be traced to it.
+    $unlistedFolders = [ordered]@{}   # folder path -> the first reason met
+    Add-FolderToNotListedTable -Table $unlistedFolders -Folders $foldersNotListed
+    foreach ($folderPath in $unlistedFolders.Keys) {
+        $fileRecordLines.Add((New-FileRecordLine -Artefact $Artefact.Name -Outcome 'folder not listed' -Source $folderPath -Entry '' -Size $null -BytesCopied $null -Sha256 '' -FileTimes $null -Detail $unlistedFolders[$folderPath]))
     }
-    # Unusual gaps for the Warnings section: an unexplained lock, or Missing where
-    # the artefact should exist on this host. Missing with no expectation either
-    # way (usage, configuration) is shown in the summary but not warned about.
-    if ($unlistedFolders.Count -gt 0 -or $partialCopies -gt 0 -or
-        (-not $script:notes.ContainsKey($Artefact.Name) -and
-         (($status -like '*not accessible*') -or
-          ($status -eq 'Missing' -and (Test-Expectation -Condition $Artefact.ExpectPresent))))) {
-        [void]$script:unusual.Add($Artefact.Name)
+    $unlistedFolderCount = $unlistedFolders.Count
+    $tally.Candidates += $unlistedFolderCount
+    $tally.Failed     += $unlistedFolderCount
+
+    $status = Format-SummaryStatus @tally
+    $note   = ''
+    $missingReason = if ($status -eq 'Missing') { Get-ExpectedMissingReason -Rules $Artefact.ExpectMissing } else { $null }
+    if ($missingReason) {
+        $note = "($missingReason)"
+    } elseif ($status -like '*not accessible*' -and (Test-HostCondition -Condition $Artefact.ExpectLocked)) {
+        $requires = if ($Artefact.Requires) { $Artefact.Requires } else { 'NTFS parser' }
+        $note = "(requires $requires)"
+    }
+    # Unusual gaps for the Warnings section: a folder that couldn't be listed or
+    # a copy that failed part-way (always, whatever the note), an unexplained
+    # lock, or Missing where the artefact should exist on this host. Missing
+    # with no expectation either way (usage, configuration) is shown in the
+    # summary but not warned about.
+    $isUnusualGap = ($unlistedFolderCount -gt 0 -or $partialCopyCount -gt 0 -or
+        (-not $note -and (($status -like '*not accessible*') -or
+                          ($status -eq 'Missing' -and (Test-HostCondition -Condition $Artefact.ExpectPresent)))))
+
+    return [pscustomobject]@{
+        Name = $Artefact.Name; Status = $status; Note = $note; IsUnusualGap = $isUnusualGap
+        UnreadableFiles = $unreadableFiles; FoldersNotListed = $foldersNotListed; SizeDifferences = $sizeDifferences
+        FileRecordLines = $fileRecordLines; CollectedFileCount = $collectedFileCount; DiskFull = $diskFull
     }
 }
 
-# --- Splitting ---
+# The row result for an artefact whose collection failed as a whole (an error
+# outside every source's own handling): Missing, warned about, with the error
+# named as a folder not listed.
+function New-FailedArtefactResult {
+    param([string]$Name, $ErrorRecord)
+    return [pscustomobject]@{
+        Name = $Name; Status = 'Missing'; Note = ''; IsUnusualGap = $true
+        UnreadableFiles  = @()
+        FoldersNotListed = @([pscustomobject]@{ Path = $Name; Reason = (Get-OneLineMessage -ErrorRecord $ErrorRecord) })
+        SizeDifferences  = @(); FileRecordLines = @(); CollectedFileCount = 0; DiskFull = $false
+    }
+}
 
-# Split a zip larger than PartSize, in place, into standard split volumes
-# <zip>.001, .002, ... and return their paths (just the zip if it fits). Works
-# from the end so the extra space needed is one part, never a second copy: the
-# last part is copied out and cut off the zip, and so on, and what is left
-# (the first part) is renamed to .001. On failure it throws, with
-# $script:splitDamaged set once the zip has been cut (it is then unusable).
+# --- Output files: opening, splitting, hashing, removing ---
+
+# Open the zip in the first output folder that works. A folder created here but
+# then unusable (e.g. the sensor refuses writes) is removed again if still empty.
+# Returns @{ Zip; ZipPath; Folder } or $null if no folder works.
+function Open-OutputZip {
+    param([string[]]$CandidateFolders, [string]$ZipName)
+    foreach ($candidate in $CandidateFolders) {
+        if (-not (Test-Path -LiteralPath (Split-Path -Path $candidate -Parent) -ErrorAction SilentlyContinue)) { continue }
+        $existed = Test-Path -LiteralPath $candidate -ErrorAction SilentlyContinue
+        try {
+            $null    = New-Item -ItemType Directory -Path $candidate -Force -ErrorAction Stop
+            $zipPath = Join-Path $candidate $ZipName
+            $zip     = [System.IO.Compression.ZipFile]::Open($zipPath, [System.IO.Compression.ZipArchiveMode]::Create)
+            return @{ Zip = $zip; ZipPath = $zipPath; Folder = $candidate }
+        } catch {
+            if (-not $existed) { try { Remove-Item -LiteralPath $candidate -Force -ErrorAction Stop } catch {} }
+        }
+    }
+    return $null
+}
+
+# Split a zip larger than VolumeSize, in place, into standard split volumes
+# <zip>.001, .002, ... Works from the end so the extra space needed is one
+# volume, never a second copy: the last volume is copied out and cut off the
+# zip, and so on, and what is left (the first volume) is renamed to .001.
+# Returns @{ Volumes; Error; ZipCut }: the output files (just the zip if it
+# fits), the error if it failed, and whether the zip had already been cut when
+# it failed (it is then unusable).
 function Split-ZipFile {
-    param([string]$Path, [long]$PartSize)
-    $length = (Get-Item -LiteralPath $Path -Force).Length
-    if ($length -le $PartSize) { return $Path }
-    $count = [int][math]::Ceiling($length / $PartSize)
-    $parts = @(for ($i = 1; $i -le $count; $i++) { '{0}.{1:D3}' -f $Path, $i })
+    param([string]$Path, [long]$VolumeSize)
+    $result = @{ Volumes = @($Path); Error = ''; ZipCut = $false }
     $zipStream = $null
     try {
+        $length = (Get-Item -LiteralPath $Path -Force -ErrorAction Stop).Length
+        if ($length -le $VolumeSize) { return $result }
+        $volumeCount = [int][math]::Ceiling($length / $VolumeSize)
+        $volumePaths = @(for ($index = 1; $index -le $volumeCount; $index++) { '{0}.{1:D3}' -f $Path, $index })
         $zipStream = [System.IO.File]::Open($Path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::None)
-        for ($i = $count; $i -ge 2; $i--) {
-            $start = [long]($i - 1) * $PartSize
-            $out = $null
+        for ($index = $volumeCount; $index -ge 2; $index--) {
+            $volumeStart  = [long]($index - 1) * $VolumeSize
+            $volumeStream = $null
             try {
-                $out = [System.IO.File]::Open($parts[$i - 1], [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
-                $zipStream.Position = $start
-                $zipStream.CopyTo($out, 1MB)
-                $out.Flush()
+                $volumeStream = [System.IO.File]::Open($volumePaths[$index - 1], [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
+                $zipStream.Position = $volumeStart
+                $zipStream.CopyTo($volumeStream, 1MB)
+                $volumeStream.Flush()
             } finally {
-                if ($out) { try { $out.Dispose() } catch {} }
+                if ($volumeStream) { try { $volumeStream.Dispose() } catch {} }
             }
-            $script:splitDamaged = $true
-            $zipStream.SetLength($start)
+            $result.ZipCut = $true
+            $zipStream.SetLength($volumeStart)
         }
+        $zipStream.Dispose()
+        $zipStream = $null
+        [System.IO.File]::Move($Path, $volumePaths[0])
+        $result.Volumes = $volumePaths
+    } catch {
+        $result.Error = if (Test-DiskFull -ErrorRecord $_) { "$systemDrive is full" } else { Get-OneLineMessage -ErrorRecord $_ }
     } finally {
         if ($zipStream) { try { $zipStream.Dispose() } catch {} }
     }
-    [System.IO.File]::Move($Path, $parts[0])
-    return $parts
+    return $result
 }
 
-# Remove output files; failures are ignored (the caller reports what is left).
+# The volume files a split may have written beside a zip (whether or not the
+# split finished).
+function Get-WrittenVolume {
+    param([string]$ZipPath)
+    for ($index = 1; $index -le 999; $index++) {
+        $volumePath = '{0}.{1:D3}' -f $ZipPath, $index
+        if (Test-Path -LiteralPath $volumePath -ErrorAction SilentlyContinue) { $volumePath }
+    }
+}
+
+# Remove output files; a failure is ignored here and reported by the caller,
+# which checks what is left.
 function Remove-OutputFile {
     param([string[]]$Path)
-    foreach ($p in $Path) { try { Remove-Item -LiteralPath $p -Force -ErrorAction Stop } catch {} }
+    foreach ($filePath in $Path) { try { Remove-Item -LiteralPath $filePath -Force -ErrorAction Stop } catch {} }
 }
-
-# --- Hashing ---
 
 # The SHA-256 of a file as lower-case hex (as sha256sum writes it), computed in
 # this process. Throws if the file can't be read.
@@ -1032,131 +1351,203 @@ function Get-FileSha256 {
     try {
         $stream = [System.IO.File]::Open($Path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::Read)
         $hasher = [System.Security.Cryptography.SHA256]::Create()
-        $digest = $hasher.ComputeHash($stream)
-        return (($digest | ForEach-Object { $_.ToString('x2') }) -join '')
+        $null   = $hasher.ComputeHash($stream)
+        return (ConvertTo-HexDigest -Hasher $hasher)
     } finally {
         if ($hasher) { try { $hasher.Dispose() } catch {} }
         if ($stream) { try { $stream.Dispose() } catch {} }
     }
 }
 
-# --- Warnings ---
+# --- Console, run log and warnings ---
 
-# Collect a warning for the Warnings section: anything the analyst should be wary
-# of. Shown early (if known by then) and again with the end-of-run summary.
-function Add-CollectorWarning {
-    param([string]$Message)
-    $script:warnings.Add($Message)
+# Print a line and keep it in the run log beside the zip. Until the output
+# folder is known the lines are buffered in $script:logLines, then written out
+# in one go (Start-RunLog). A log that can't be written never affects the run.
+function Write-ConsoleAndLog {
+    param([string]$Text = '')
+    Write-Output $Text
+    if ($script:logPath) {
+        try { [System.IO.File]::AppendAllText($script:logPath, $Text + "`r`n", $script:utf8NoBom) } catch {}
+    } else {
+        $script:logLines.Add($Text)
+    }
 }
 
-# Print the Warnings section: one line per warning, or "none" when -ShowNone.
-function Write-CollectorWarning {
+# Create the run log beside the zip (same name, .log) with everything printed
+# so far; Write-ConsoleAndLog appends from then on. Returns its path, or '' if
+# it couldn't be written (the console still shows everything).
+function Start-RunLog {
+    param([string]$ZipPath)
+    $logPath = [System.IO.Path]::ChangeExtension($ZipPath, '.log')
+    try {
+        [System.IO.File]::WriteAllText($logPath, (($script:logLines | ForEach-Object { $_ + "`r`n" }) -join ''), $script:utf8NoBom)
+        $script:logPath = $logPath
+        return $logPath
+    } catch { return '' }
+}
+
+# Add a warning to the Warnings section: anything the analyst should be wary
+# of. Shown early (if known by then) and again with the end-of-run summary.
+# Detail lines (e.g. one per unusual gap) are printed under the message.
+function Add-CollectorWarning {
+    param([string]$Message, [string[]]$Detail = @())
+    $script:warnings.Add([pscustomobject]@{ Message = $Message; Detail = @($Detail) })
+}
+
+# Print the Warnings section: one line per warning, its detail lines indented
+# under it, or "Warnings: none" when -ShowNone.
+function Write-WarningSection {
     param([switch]$ShowNone)
     if ($script:warnings.Count -eq 0) {
-        if ($ShowNone) { Write-Line -Text 'Warnings: none' }
+        if ($ShowNone) { Write-ConsoleAndLog -Text 'Warnings: none' }
         return
     }
-    Write-Line -Text 'Warnings:'
-    foreach ($w in $script:warnings) { Write-Line -Text "  - $w" }
+    Write-ConsoleAndLog -Text 'Warnings:'
+    foreach ($warning in $script:warnings) {
+        Write-ConsoleAndLog -Text "  - $($warning.Message)"
+        foreach ($detailLine in $warning.Detail) { Write-ConsoleAndLog -Text "      $detailLine" }
+    }
+}
+
+# --- The report ---
+
+# The artefact summary: three aligned columns - name, status, and a note where
+# the gap is normal for this host (the reason it's missing, or "(requires NTFS
+# parser)" for locked files).
+function Write-ArtefactSummary {
+    param($RowResults)
+    Write-ConsoleAndLog -Text ''
+    Write-ConsoleAndLog -Text 'Artefact summary:'
+    $nameWidth   = ($RowResults | ForEach-Object { $_.Name.Length }   | Measure-Object -Maximum).Maximum
+    $statusWidth = ($RowResults | ForEach-Object { $_.Status.Length } | Measure-Object -Maximum).Maximum
+    foreach ($row in $RowResults) {
+        Write-ConsoleAndLog -Text ((("  {0,-" + $nameWidth + "} {1,-" + $statusWidth + "} {2}") -f $row.Name, $row.Status, $row.Note).TrimEnd())
+    }
+}
+
+# The lists under the summary, only when there is something to list: folders
+# that couldn't be listed (each once, with the first reason met) and copies
+# whose size differs from the source's size when it was opened.
+function Write-GapList {
+    param($FoldersNotListed, $SizeDifferences)
+    if ($FoldersNotListed.Count -gt 0) {
+        Write-ConsoleAndLog -Text ''
+        Write-ConsoleAndLog -Text 'Folders not listed (what they hold is counted as not accessible):'
+        foreach ($folderPath in $FoldersNotListed.Keys) { Write-ConsoleAndLog -Text ("  {0}: {1}" -f $folderPath, $FoldersNotListed[$folderPath]) }
+    }
+    if ($SizeDifferences.Count -gt 0) {
+        Write-ConsoleAndLog -Text ''
+        Write-ConsoleAndLog -Text 'Copies whose size differs from the source when it was opened:'
+        foreach ($difference in $SizeDifferences) {
+            $openedText = if ($null -ne $difference.SizeWhenOpened) { "$($difference.SizeWhenOpened) bytes when opened" } else { 'size when opened unknown' }
+            $line = "  {0}: {1} bytes copied, {2}" -f $difference.Path, $difference.BytesCopied, $openedText
+            if ($difference.ReadError) { $line += "; read failed, the zip entry is incomplete ($($difference.ReadError))" }
+            Write-ConsoleAndLog -Text $line
+        }
+    }
+}
+
+# The retrieval block: labels on their own line and bare commands below (the
+# paths are long and wrap), so each command can be copied as-is; the SHA-256
+# lines in sha256sum's format ("<hash>  <name>"), so they can be checked with
+# sha256sum -c once the files are downloaded.
+function Write-RetrievalCommand {
+    param([string[]]$OutputFiles, $OutputHashes, [string]$LogPath)
+    if ($OutputFiles.Count -gt 1) {
+        Write-ConsoleAndLog -Text "Retrieve the zip, split into $($OutputFiles.Count) volumes, with:"
+    } else {
+        Write-ConsoleAndLog -Text 'Retrieve the zip with:'
+    }
+    foreach ($outputFile in $OutputFiles) { Write-ConsoleAndLog -Text "getfile `"$outputFile`"" }
+    Write-ConsoleAndLog -Text $(if ($OutputFiles.Count -gt 1) { 'SHA-256 of each volume:' } else { 'SHA-256 of the zip:' })
+    foreach ($outputFile in $OutputFiles) {
+        $fileName = Split-Path -Path $outputFile -Leaf
+        if ($OutputHashes[$outputFile]) { Write-ConsoleAndLog -Text ("{0}  {1}" -f $OutputHashes[$outputFile], $fileName) }
+        else                            { Write-ConsoleAndLog -Text ("not calculated  {0}" -f $fileName) }
+    }
+    if ($LogPath) {
+        Write-ConsoleAndLog -Text 'Retrieve the run log with:'
+        Write-ConsoleAndLog -Text "getfile `"$LogPath`""
+    }
+}
+
+# Follow-up getfile commands for files this script found but couldn't read and
+# the Defender sensor can retrieve directly - outcome-based: only reads that
+# actually failed, in collection order (so metafiles first). Metafiles are
+# listed only if flagged GetFile, with no Test-Path (PowerShell can't reliably
+# see them); other files must still exist. Kept lean: each row's FollowUp scope
+# only (machine-wide by default; for user hives, the users' own, not the
+# built-in service accounts'), and no registry transaction logs (inferred from
+# the hive). Other locked files, ESE logs included, are listed.
+function Write-FollowUpCommand {
+    param($UnreadableFiles)
+    $followUpPaths = New-Object 'System.Collections.Generic.List[string]'
+    foreach ($file in $UnreadableFiles) {
+        if ($file.Literal) {
+            if ($file.GetFile) { $followUpPaths.Add($file.Path) }
+            continue
+        }
+        if ($file.Scope -ne $file.FollowUp) { continue }
+        if ($file.IsTransactionLog)         { continue }
+        if (Test-Path -LiteralPath $file.Path -ErrorAction SilentlyContinue) { $followUpPaths.Add($file.Path) }
+    }
+    if ($followUpPaths.Count -eq 0) { return }
+    # Bare commands under a title, so the block can be copied and pasted as-is.
+    Write-ConsoleAndLog -Text ''
+    Write-ConsoleAndLog -Text 'Additional inaccessible artefacts (locked from PowerShell - retrieve directly in this Live Response session):'
+    foreach ($followUpPath in $followUpPaths) { Write-ConsoleAndLog -Text "getfile `"$followUpPath`"" }
 }
 
 # =============================== MAIN ===============================
 
-# Run log state (Write-Line): buffered until the output folder is known.
-$script:logLines    = New-Object 'System.Collections.Generic.List[string]'
-$script:logPath     = $null
-$script:logEncoding = New-Object System.Text.UTF8Encoding($false)
+# Script-scope state: the run log, the console's warnings, the per-run caches
+# and the zip's entry names. Everything else travels in results.
+$script:utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+$script:logLines  = New-Object 'System.Collections.Generic.List[string]'      # console lines until the log exists
+$script:logPath   = $null                                                     # the run log, once created
+$script:warnings  = New-Object 'System.Collections.Generic.List[object]'      # Warnings section, in the order found
+$script:folderLinkCache     = @{}                                             # folder path -> is a link (Test-FolderPathIsLink)
+$script:onDiskCasePathCache = @{}                                             # folder path -> on-disk case (Get-OnDiskCasePath)
+$script:zipEntryNames = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)   # every entry written
+$script:copyBuffer    = New-Object byte[] (1MB)                               # Copy-FileToZip's buffer, allocated once
+$script:localDrives   = @()                                                   # Get-LocalDrive's result, read by Get-DriveRoot
 
 # Banner first, before any status, so the version is the first thing printed.
 # The blank line above it is console-only, to set it off from Live Response's
 # transcript line; the run log starts with the banner.
 Write-Output ''
-Write-Line -Text "Live Response collector v$CollectorVersion"
-Write-Line -Text ''
-Write-Line -Text ("Host {0}, started {1}" -f $hostName, $runStart.ToString("yyyy-MM-dd'T'HH:mm:ss'Z'"))
+Write-ConsoleAndLog -Text "Live Response collector v$CollectorVersion"
+Write-ConsoleAndLog -Text ''
+Write-ConsoleAndLog -Text ("Host {0}, started {1}" -f $hostName, $runStart.ToString("yyyy-MM-dd'T'HH:mm:ss'Z'"))
 $hostInfo = Get-HostInfo
 $osName   = @($hostInfo.Caption, $hostInfo.Version | Where-Object { $_ }) -join ' '
-if ($osName) { Write-Line -Text "OS $osName" }
+if ($osName) { Write-ConsoleAndLog -Text "OS $osName" }
 
-# Script-scope state.
-$script:added   = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
-$script:count   = 0                                                    # total files written to the zip
-$script:failed  = New-Object 'System.Collections.Generic.List[object]' # found but unreadable: Path, Scope, Literal, GetFile
-$script:linkCache = @{}                                                # folder path -> is a junction/symlink (Test-FolderLink)
-$script:caseCache = @{}                                                # folder path -> on-disk case (Get-DiskCasePath)
-$script:listingFailures = New-Object 'System.Collections.Generic.List[object]'  # folders that exist but couldn't be listed: Path, Reason
-$script:sizeDifferences = New-Object 'System.Collections.Generic.List[object]'  # copies whose bytes differ from the source's size when opened
-$script:copyBuffer = New-Object byte[] (1MB)                                    # Add-FileToZip's copy buffer, allocated once
-$script:diskFull  = $false                                             # set when the system drive fills up (Test-DiskFull)
-$script:diskFullAt = ''                                                # artefact being collected when it did
-$script:summary = [ordered]@{}                                         # artefact name -> status, in display order
-$script:notes   = @{}                                                  # artefact name -> summary note for a gap that's normal here
-$script:warnings = New-Object 'System.Collections.Generic.List[string]'     # Warnings section, in the order found
-$script:unusual  = New-Object 'System.Collections.Generic.HashSet[string]'  # artefacts whose gap is worth a closer look
-
-# Fix the run order once: group, then name ignoring non-alphanumerics. Collection,
-# progress numbering and the summary all follow it. Lines start as 'Missing'.
+# Fix the run order once: group, then name ignoring non-alphanumerics.
+# Collection, progress numbering and the summary all follow it.
 $artefacts = @($artefacts | Sort-Object -Property { $_.Group }, { $_.Name -replace '[^A-Za-z0-9]', '' })
-foreach ($a in $artefacts) { $script:summary[$a.Name] = 'Missing' }
-$script:stageTotal = $artefacts.Count
-$script:stageNum   = 0
 
-# Local drives, for per-volume artefacts (Volumes = 'All' / 'NTFS'): every ready
-# drive except network ones - fixed and removable alike - with its file system,
-# the system drive first. Best effort: drives that aren't ready (no media,
-# locked) are simply skipped.
-$script:volumes = New-Object 'System.Collections.Generic.List[object]'
-try {
-    foreach ($d in [System.IO.DriveInfo]::GetDrives()) {
-        try {
-            if ($d.DriveType -eq [System.IO.DriveType]::Network -or
-                $d.DriveType -eq [System.IO.DriveType]::NoRootDirectory) { continue }
-            $root = $d.Name.TrimEnd('\')
-            if ($d.IsReady) { $script:volumes.Add([pscustomobject]@{ Root = $root; Format = $d.DriveFormat }) }
-        } catch {}
-    }
-} catch {}
-if (-not ($script:volumes | Where-Object { $_.Root -eq $sysDrive })) {
-    $script:volumes.Insert(0, [pscustomobject]@{ Root = $sysDrive; Format = 'NTFS' })   # never lose the system drive
-}
-$script:volumes = @($script:volumes | Sort-Object -Property { $_.Root -ne $sysDrive }, Root)
 # The drives searched, so a skipped drive can't pass for one with nothing on it.
-Write-Line -Text ('Drives ' + (@($script:volumes | ForEach-Object { '{0} ({1})' -f $_.Root, $_.Format }) -join ', '))
+$script:localDrives = Get-LocalDrive
+Write-ConsoleAndLog -Text ('Drives ' + (@($script:localDrives | ForEach-Object { '{0} ({1})' -f $_.Root, $_.Format }) -join ', '))
 
 try {
-    Add-Type -AssemblyName System.IO.Compression
-    Add-Type -AssemblyName System.IO.Compression.FileSystem
-} catch {}
-
-# Open the zip in the first output folder that works. A folder created here but
-# then unusable (e.g. the sensor refuses writes) is removed again if still empty.
-$zip = $null; $outDir = $null; $zipPath = $null
-foreach ($candidate in $outDirs) {
-    if (-not (Test-Path -LiteralPath (Split-Path -Path $candidate -Parent))) { continue }
-    $existed = Test-Path -LiteralPath $candidate
-    try {
-        $null    = New-Item -ItemType Directory -Path $candidate -Force -ErrorAction Stop
-        $zipPath = Join-Path $candidate $zipName
-        $zip     = [System.IO.Compression.ZipFile]::Open($zipPath, [System.IO.Compression.ZipArchiveMode]::Create)
-        $outDir  = $candidate
-        break
-    } catch {
-        $zip = $null
-        if (-not $existed) { try { Remove-Item -LiteralPath $candidate -Force -ErrorAction Stop } catch {} }
-    }
-}
-if (-not $zip) {
-    Write-Line -Text ('Could not create the output zip in: ' + ($outDirs -join '; '))
+    Add-Type -AssemblyName System.IO.Compression -ErrorAction Stop
+    Add-Type -AssemblyName System.IO.Compression.FileSystem -ErrorAction Stop
+} catch {
+    Write-ConsoleAndLog -Text ('The zip library could not be loaded: ' + (Get-OneLineMessage -ErrorRecord $_))
     return
 }
 
-# Run log beside the zip, same name with .log: write what's been printed so far,
-# then Write-Line appends.
-$logPath = [System.IO.Path]::ChangeExtension($zipPath, '.log')
-try {
-    [System.IO.File]::WriteAllText($logPath, (($script:logLines | ForEach-Object { $_ + "`r`n" }) -join ''), $script:logEncoding)
-    $script:logPath = $logPath
-} catch {}
+$output = Open-OutputZip -CandidateFolders $outputFolders -ZipName $zipName
+if (-not $output) {
+    Write-ConsoleAndLog -Text ('Could not create the output zip in: ' + ($outputFolders -join '; '))
+    return
+}
+$zip     = $output.Zip
+$zipPath = $output.ZipPath
+$logPath = Start-RunLog -ZipPath $zipPath
 
 # Warnings known before collection starts, printed now so they're seen up front.
 try {
@@ -1164,24 +1555,58 @@ try {
     if (-not $identity.IsSystem) {
         Add-CollectorWarning -Message "Not running as SYSTEM but as $($identity.Name): files only SYSTEM can read are counted as not accessible."
     }
-} catch {}
+} catch {
+    Add-CollectorWarning -Message 'The running account could not be determined.'
+}
 if ($null -eq $hostInfo.Build -or $null -eq $hostInfo.Server) {
     Add-CollectorWarning -Message "Host details could not be fully determined: summary notes and missing-artefact warnings may be incomplete."
 }
-if ($outDir -ne $outDirs[0]) {
-    Add-CollectorWarning -Message "Output written to a fallback folder ($outDir), not the Defender sensor's Temp\Collections."
+if ($output.Folder -ne $outputFolders[0]) {
+    Add-CollectorWarning -Message "Output written to a fallback folder ($($output.Folder)), not the Defender sensor's Temp\Collections."
 }
 if ($script:warnings.Count -gt 0) {
-    Write-Line -Text ''
-    Write-CollectorWarning
+    Write-ConsoleAndLog -Text ''
+    Write-WarningSection
 }
-Write-Line -Text ''
+Write-ConsoleAndLog -Text ''
 
+# Collect every artefact, one progress line each, then write the per-file
+# record as the zip's last entry. Each row is isolated: a failure skips only
+# that row.
+$rowResults       = New-Object 'System.Collections.Generic.List[object]'
+$fileRecordLines  = New-Object 'System.Collections.Generic.List[string]'
+$rootsNotListed   = New-Object 'System.Collections.Generic.List[object]'
+$diskFullArtefact = ''
 try {
-    $userProfiles = @(Get-UserProfilePath)
-    foreach ($a in $artefacts) {
-        if ($script:diskFull) { break }
-        try { Add-Artefact -Zip $zip -Artefact $a -UserProfile $userProfiles } catch {}
+    $userProfilePaths = @(Get-UserProfilePath -FoldersNotListed $rootsNotListed)
+    # A profile root that couldn't be listed belongs to no artefact row: its
+    # record row says 'User profiles'.
+    $profileRootsNotListed = [ordered]@{}   # folder path -> the first reason met
+    Add-FolderToNotListedTable -Table $profileRootsNotListed -Folders $rootsNotListed
+    foreach ($folderPath in $profileRootsNotListed.Keys) {
+        $fileRecordLines.Add((New-FileRecordLine -Artefact 'User profiles' -Outcome 'folder not listed' -Source $folderPath -Entry '' -Size $null -BytesCopied $null -Sha256 '' -FileTimes $null -Detail $profileRootsNotListed[$folderPath]))
+    }
+    $progressIndex    = 0
+    foreach ($artefact in $artefacts) {
+        $progressIndex++
+        Write-ConsoleAndLog -Text ("[{0:D2}/{1}] Collecting {2}" -f $progressIndex, $artefacts.Count, $artefact.Name)
+        $rowResult = $null
+        try {
+            $rowResult = Add-ArtefactToZip -Zip $zip -Artefact $artefact -UserProfilePaths $userProfilePaths
+        } catch {
+            $rowResult = New-FailedArtefactResult -Name $artefact.Name -ErrorRecord $_
+        }
+        $rowResults.Add($rowResult)
+        foreach ($line in $rowResult.FileRecordLines) { $fileRecordLines.Add($line) }
+        if ($rowResult.DiskFull) { $diskFullArtefact = $artefact.Name; break }
+    }
+    if (-not $diskFullArtefact) {
+        try {
+            Write-FileRecord -Zip $zip -EntryName $fileRecordName -Lines $fileRecordLines
+        } catch {
+            if (Test-DiskFull -ErrorRecord $_) { $diskFullArtefact = $fileRecordName }
+            else { Add-CollectorWarning -Message ("$fileRecordName could not be written into the zip (" + (Get-OneLineMessage -ErrorRecord $_) + ').') }
+        }
     }
 } finally {
     if ($zip) { try { $zip.Dispose() } catch {} }   # writes the zip's index; can fail if the disk is full
@@ -1189,161 +1614,86 @@ try {
 
 # Disk full: the zip is partial (and its index may not have been written), so it
 # is useless. Delete it, tell the analyst, and stop - they free space and re-run.
-if ($script:diskFull) {
+if ($diskFullArtefact) {
     Remove-OutputFile -Path $zipPath
-    $zipFate = if (Test-Path -LiteralPath $zipPath) { "could not be deleted and is unusable: $zipPath" } else { 'was deleted' }
-    Add-CollectorWarning -Message "Collection stopped while collecting $($script:diskFullAt): $sysDrive is full. The partial zip $zipFate. Free up space on $sysDrive and run the collector again."
-    Write-Line -Text ''
-    Write-CollectorWarning
+    $zipFate = if (Test-Path -LiteralPath $zipPath -ErrorAction SilentlyContinue) { "could not be deleted and is unusable: $zipPath" } else { 'was deleted' }
+    Add-CollectorWarning -Message "Collection stopped while collecting ${diskFullArtefact}: $systemDrive is full. The partial zip $zipFate. Free up space on $systemDrive and run the collector again."
+    Write-ConsoleAndLog -Text ''
+    Write-WarningSection
     return
 }
 
-$bytes = $null
-try { $bytes = (Get-Item -LiteralPath $zipPath -Force).Length } catch {}
+$zipBytes = $null
+try { $zipBytes = (Get-Item -LiteralPath $zipPath -Force -ErrorAction Stop).Length } catch { $zipBytes = $null }
 
 # Split a large zip into volumes. If it fails before the zip was cut, the whole
 # zip is kept (any volumes already written are removed); once cut, nothing usable
 # is left, so everything goes and the analyst runs again - as for a full disk.
-$outFiles = @($zipPath)
-$script:splitDamaged = $false
-try {
-    $outFiles = @(Split-ZipFile -Path $zipPath -PartSize $zipPartSize)
-} catch {
-    $reason = if (Test-DiskFull -ErrorRecord $_) { "$sysDrive is full" } else { Get-OneLineMessage -ErrorRecord $_ }
-    $written = @(for ($i = 1; $i -le 999; $i++) {
-        $v = '{0}.{1:D3}' -f $zipPath, $i
-        if (Test-Path -LiteralPath $v) { $v }
-    })
-    Remove-OutputFile -Path $written
-    if ($script:splitDamaged) {
+$split = Split-ZipFile -Path $zipPath -VolumeSize $zipVolumeSize
+$outputFiles = @($split.Volumes)
+if ($split.Error) {
+    $writtenVolumes = @(Get-WrittenVolume -ZipPath $zipPath)
+    Remove-OutputFile -Path $writtenVolumes
+    if ($split.ZipCut) {
         Remove-OutputFile -Path $zipPath
-        $left = @(@($zipPath) + $written | Where-Object { Test-Path -LiteralPath $_ })
-        $fate = if ($left) { 'could not all be deleted and are unusable: ' + ($left -join '; ') } else { 'were deleted' }
-        Add-CollectorWarning -Message "Splitting the zip into volumes failed part-way ($reason). The zip and its volumes $fate. Run the collector again."
-        Write-Line -Text ''
-        Write-CollectorWarning
+        $leftBehind = @(@($zipPath) + $writtenVolumes | Where-Object { Test-Path -LiteralPath $_ -ErrorAction SilentlyContinue })
+        $fate = if ($leftBehind) { 'could not all be deleted and are unusable: ' + ($leftBehind -join '; ') } else { 'were deleted' }
+        Add-CollectorWarning -Message "Splitting the zip into volumes failed part-way ($($split.Error)). The zip and its volumes $fate. Run the collector again."
+        Write-ConsoleAndLog -Text ''
+        Write-WarningSection
         return
     }
-    Add-CollectorWarning -Message "The zip could not be split into volumes ($reason) and was kept whole."
+    Add-CollectorWarning -Message "The zip could not be split into volumes ($($split.Error)) and was kept whole."
+    $outputFiles = @($zipPath)
 }
-foreach ($f in $outFiles) {
+foreach ($outputFile in $outputFiles) {
     try {
-        $size = (Get-Item -LiteralPath $f -Force).Length
-        if ($size -gt 3GB) {
-            Add-CollectorWarning -Message ("{0} is {1} GB, over getfile's 3 GB per-file limit." -f (Split-Path -Path $f -Leaf), [math]::Round($size / 1GB, 2))
+        $outputSize = (Get-Item -LiteralPath $outputFile -Force -ErrorAction Stop).Length
+        if ($outputSize -gt 3GB) {
+            Add-CollectorWarning -Message ("{0} is {1} GB, over getfile's 3 GB per-file limit." -f (Split-Path -Path $outputFile -Leaf), [math]::Round($outputSize / 1GB, 2))
         }
-    } catch {}
+    } catch { continue }   # a size that can't be read: the hash step below reports the file
 }
 
 # SHA-256 of every output file (the zip, or each volume), so the download can be
 # checked against it. One that can't be calculated is a warning, never left out.
-$outHashes = [ordered]@{}   # output file path -> lower-case SHA-256, or $null
-foreach ($f in $outFiles) {
-    $outHashes[$f] = $null
+$outputHashes = [ordered]@{}   # output file path -> lower-case SHA-256, or $null
+foreach ($outputFile in $outputFiles) {
+    $outputHashes[$outputFile] = $null
     try {
-        $outHashes[$f] = Get-FileSha256 -Path $f
+        $outputHashes[$outputFile] = Get-FileSha256 -Path $outputFile
     } catch {
-        Add-CollectorWarning -Message ("SHA-256 of {0} could not be calculated ({1}): the download can't be checked against it." -f (Split-Path -Path $f -Leaf), (Get-OneLineMessage -ErrorRecord $_))
+        Add-CollectorWarning -Message ("SHA-256 of {0} could not be calculated ({1}): the download can't be checked against it." -f (Split-Path -Path $outputFile -Leaf), (Get-OneLineMessage -ErrorRecord $_))
     }
 }
 
-# Folders that couldn't be listed and copies that failed part-way, named under
-# the summary (each folder once, with the first reason met).
-$unlistedReport = [ordered]@{}   # folder path -> reason
-foreach ($failure in $script:listingFailures) {
-    if (-not $unlistedReport.Contains($failure.Path)) { $unlistedReport[$failure.Path] = $failure.Reason }
-}
-$partialCopyCount = @($script:sizeDifferences | Where-Object { $_.ReadError }).Count
-if ($unlistedReport.Count -gt 0) {
-    Add-CollectorWarning -Message ("{0} folder(s) could not be listed; what they hold is counted as not accessible (named under 'Folders not listed')." -f $unlistedReport.Count)
+# Gather the rows' findings for the warnings and the lists under the summary.
+# Folders not listed: the profile roots' first, then each row's.
+$foldersNotListed = [ordered]@{}   # folder path -> the first reason met
+Add-FolderToNotListedTable -Table $foldersNotListed -Folders $rootsNotListed
+foreach ($rowResult in $rowResults) { Add-FolderToNotListedTable -Table $foldersNotListed -Folders $rowResult.FoldersNotListed }
+$sizeDifferences  = @($rowResults | ForEach-Object { $_.SizeDifferences })
+$partialCopyCount = @($sizeDifferences | Where-Object { $_.ReadError }).Count
+$collectedCount   = [int]($rowResults | Measure-Object -Property CollectedFileCount -Sum).Sum
+if ($foldersNotListed.Count -gt 0) {
+    Add-CollectorWarning -Message ("{0} folder(s) could not be listed; what they hold is counted as not accessible (named under 'Folders not listed')." -f $foldersNotListed.Count)
 }
 if ($partialCopyCount -gt 0) {
     Add-CollectorWarning -Message ("{0} copy(ies) failed part-way and are incomplete in the zip (named under 'Copies whose size differs')." -f $partialCopyCount)
 }
+# Unusual gaps (see Add-ArtefactToZip), one per line, in summary order.
+$unusualGaps = @($rowResults | Where-Object { $_.IsUnusualGap } | ForEach-Object { "$($_.Name) ($($_.Status))" })
+if ($unusualGaps.Count -gt 0) { Add-CollectorWarning -Message 'Unusual gaps:' -Detail $unusualGaps }
 
-# Unusual gaps (see Add-Artefact), in summary order - the ones worth a closer look.
-$unusual = foreach ($name in $script:summary.Keys) {
-    if ($script:unusual.Contains($name)) { "$name ($($script:summary[$name]))" }
-}
-if ($unusual) { Add-CollectorWarning -Message ('Unusual gaps: ' + (@($unusual) -join '; ') + '.') }
+# --- The report: warnings, summary, the lists, the retrieval commands ---
 
-# --- Output: warnings, summary, zip location, and runnable retrieval commands ---
+Write-ConsoleAndLog -Text ''
+Write-WarningSection -ShowNone
+Write-ArtefactSummary -RowResults $rowResults
+Write-GapList -FoldersNotListed $foldersNotListed -SizeDifferences $sizeDifferences
 
-Write-Line -Text ''
-Write-CollectorWarning -ShowNone
-
-Write-Line -Text ''
-Write-Line -Text 'Artefact summary:'
-# Three columns: name, status, and a note where the gap is normal for this host
-# (the reason it's missing, or "(requires NTFS parser)" for locked files). Name and status widths follow the longest entry, so everything lines up.
-$nameWidth   = ($script:summary.Keys   | ForEach-Object { $_.Length } | Measure-Object -Maximum).Maximum
-$statusWidth = ($script:summary.Values | ForEach-Object { $_.Length } | Measure-Object -Maximum).Maximum
-foreach ($name in $script:summary.Keys) {
-    $note = if ($script:notes.ContainsKey($name)) { $script:notes[$name] } else { '' }
-    Write-Line -Text ((("  {0,-" + $nameWidth + "} {1,-" + $statusWidth + "} {2}") -f $name, $script:summary[$name], $note).TrimEnd())
-}
-
-if ($unlistedReport.Count -gt 0) {
-    Write-Line -Text ''
-    Write-Line -Text 'Folders not listed (what they hold is counted as not accessible):'
-    foreach ($folder in $unlistedReport.Keys) { Write-Line -Text ("  {0}: {1}" -f $folder, $unlistedReport[$folder]) }
-}
-if ($script:sizeDifferences.Count -gt 0) {
-    Write-Line -Text ''
-    Write-Line -Text 'Copies whose size differs from the source when it was opened:'
-    foreach ($difference in $script:sizeDifferences) {
-        $opened = if ($null -ne $difference.SizeWhenOpened) { "$($difference.SizeWhenOpened) bytes when opened" } else { 'size when opened unknown' }
-        $line   = "  {0}: {1} bytes copied, {2}" -f $difference.Path, $difference.Copied, $opened
-        if ($difference.ReadError) { $line += "; read failed, the zip entry is incomplete ($($difference.ReadError))" }
-        Write-Line -Text $line
-    }
-}
-
-$zipSize = if ($null -ne $bytes) { " ($([math]::Round($bytes / 1MB, 2)) MB)" } else { '' }
-
-Write-Line -Text ''
-Write-Line -Text "Collected $script:count files total$zipSize"
-# Labels on their own line and bare commands below (the paths are long and wrap),
-# so each command can be copied as-is.
-if ($outFiles.Count -gt 1) {
-    Write-Line -Text "Retrieve the zip, split into $($outFiles.Count) volumes, with:"
-} else {
-    Write-Line -Text 'Retrieve the zip with:'
-}
-foreach ($f in $outFiles) { Write-Line -Text "getfile `"$f`"" }
-# In sha256sum's format ("<hash>  <name>"), so the lines can be checked with
-# sha256sum -c once the files are downloaded.
-Write-Line -Text $(if ($outFiles.Count -gt 1) { 'SHA-256 of each volume:' } else { 'SHA-256 of the zip:' })
-foreach ($f in $outFiles) {
-    $leaf = Split-Path -Path $f -Leaf
-    if ($outHashes[$f]) { Write-Line -Text ("{0}  {1}" -f $outHashes[$f], $leaf) }
-    else                { Write-Line -Text ("not calculated  {0}" -f $leaf) }
-}
-if ($script:logPath) {
-    Write-Line -Text 'Retrieve the run log with:'
-    Write-Line -Text "getfile `"$($script:logPath)`""
-}
-
-# Follow-up getfile commands for files this script found but couldn't read and
-# the Defender sensor can retrieve directly - outcome-based: only reads that
-# actually failed, in collection order (so metafiles first). Metafiles are listed
-# only if flagged GetFile, with no Test-Path (PowerShell can't reliably see them);
-# other files must still exist. Kept lean: each row's FollowUp scope only
-# (machine-wide by default; for user hives, the users' own, not the built-in
-# service accounts'), and no transaction logs (inferred from the hive).
-$followups = New-Object 'System.Collections.Generic.List[string]'
-foreach ($f in $script:failed) {
-    if ($f.Literal) {
-        if ($f.GetFile) { $followups.Add($f.Path) }
-        continue
-    }
-    if ($f.Scope -ne $f.FollowUp)       { continue }
-    if ($f.Path -match '\.LOG\d*$')     { continue }
-    if (Test-Path -LiteralPath $f.Path) { $followups.Add($f.Path) }
-}
-if ($followups.Count -gt 0) {
-    # Bare commands under a title, so the block can be copied and pasted as-is.
-    Write-Line -Text ''
-    Write-Line -Text 'Additional inaccessible artefacts (locked from PowerShell - retrieve directly in this Live Response session):'
-    foreach ($p in $followups) { Write-Line -Text "getfile `"$p`"" }
-}
+$zipSizeText = if ($null -ne $zipBytes) { " ($([math]::Round($zipBytes / 1MB, 2)) MB)" } else { '' }
+Write-ConsoleAndLog -Text ''
+Write-ConsoleAndLog -Text "Collected $collectedCount files total$zipSizeText"
+Write-RetrievalCommand -OutputFiles $outputFiles -OutputHashes $outputHashes -LogPath $logPath
+Write-FollowUpCommand -UnreadableFiles @($rowResults | ForEach-Object { $_.UnreadableFiles })
