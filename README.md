@@ -114,12 +114,14 @@ certificate.
 
 ### Requirements
 
-- Windows PowerShell 5.1 on the device.
+- Windows PowerShell 5.1 on the device: it runs where Live Response and
+  Windows PowerShell 5.1 run. The XP and Windows 7 forms it collects are
+  found on disks and in `Windows.old` of newer installs.
 - Microsoft Defender for Endpoint Live Response, which runs the script as
   SYSTEM. Run any other way, files only SYSTEM can read are counted as not
   accessible, and the run says so in its Warnings.
-- Free space on the system drive for the zip (and one volume more when it is
-  split).
+- Free space on the system drive for the zip, above a 1 GiB reserve left for
+  the host (and one volume more when it is split).
 
 ## Usage
 
@@ -144,14 +146,15 @@ getfile "C:\ProgramData\Microsoft\Windows Defender Advanced Threat Protection\Te
 - `getfile` may deliver a file gzip-wrapped (`.gz`); the zip inside is
   unchanged, and the SHA-256 is the zip's.
 - If it lists **Additional inaccessible artefacts**, those are files
-  PowerShell could not open (e.g. `$MFT`, locked hives): paste the printed
+  PowerShell could not read (e.g. `$MFT`, locked hives): paste the printed
   `getfile` lines into the same session to retrieve them through the Defender
   sensor.
 - `collection.csv`, at the zip's root, is the per-file record: every file
   collected or found but not readable, with its outcome (`collected`,
-  `size changed`, `incomplete`, `not accessible`), size, bytes copied,
-  SHA-256, times and, for a failure, the error; and every folder that
-  couldn't be listed (`folder not listed`, with the reason).
+  `size changed`, `incomplete`, `not accessible`, `not local`), size, bytes
+  copied, SHA-256, times and, for a failure, the error; every folder that
+  couldn't be listed (`folder not listed`, with the reason); and any
+  artefact whose collection failed as a whole (`artefact failed`).
 
 ## What it collects
 
@@ -245,17 +248,25 @@ list (registry transaction logs excepted).
 ## How it works
 
 - **Best effort.** Anything that can't be read is skipped and counted in the
-  summary; the run never stops on an error, except when the output can't be
-  completed (a full system drive, or a split that fails part-way): it then
-  deletes the partial output and asks you to run it again.
+  summary; the run never stops on an error, except to protect the output or
+  the host: a full system drive, free space below the 1 GiB reserve, a zip
+  that can't be finished or read back, or a split that fails part-way. It
+  then deletes the partial output and asks you to run it again.
+- **Checked before it is offered.** Once the zip is closed it is read back:
+  every entry written must be in its index, with `collection.csv` last.
+  Only then is it split, hashed and printed for `getfile`.
+- **Cloud-only files.** A file whose content isn't on the disk (a OneDrive
+  Files On-Demand placeholder, an offline file) is not read, so nothing is
+  downloaded; it is in `collection.csv` as `not local` and counted as not
+  accessible.
 - **Warnings.** Anything worth a closer look is listed in one Warnings
   section: shown at the start if known by then, and again before the summary
   (or "Warnings: none"). It covers unusual gaps (artefacts that should exist
   on this host but are missing, and unexplained locks), not running as
   SYSTEM, a fallback output folder, folders that couldn't be listed, copies
   that failed part-way, a zip that couldn't be split into volumes, a file over
-  `getfile`'s 3 GB limit, a SHA-256 that couldn't be calculated, and a full
-  disk.
+  `getfile`'s 3 GB limit, a SHA-256 that couldn't be calculated, files not
+  read because their content isn't on the disk, and a run that had to stop.
 - **Fail closed.** A folder that exists but can't be listed counts as *Not
   accessible*, never *Missing*, and is named under the summary. A copy that
   fails part-way stays in the zip, incomplete (a zip can't drop an entry once
@@ -296,8 +307,8 @@ list (registry transaction logs excepted).
   `<HOSTNAME>_<UTC timestamp>Z.zip` (or its volumes) and a `.log` of the same
   name with the run's console output. The collector doesn't delete its output.
 - **Footprint.** Writes the output folder, the zip (or its volumes) and its
-  log; nothing is downloaded or installed, and no child processes are
-  started.
+  log, leaving at least 1 GiB free on the drive; nothing is downloaded or
+  installed, and no child processes are started.
 - **Live Response limits.** `getfile` retrieves up to 3 GB per file, and slow
   links can time out first; `run` commands time out after 30 minutes. Split
   volumes keep each `getfile` well within its size and time limits; the
@@ -345,7 +356,8 @@ are not counted either.
   the MFT change time is not recorded.
 - A file that was being written to while it was copied is in the zip as it was
   read, and is named under the summary and in `collection.csv` as
-  `size changed`.
+  `size changed`. `collected` means the read completed; a change that keeps
+  the file's size isn't detected.
 - The run says nothing about the source after it ended: the device is live,
   and the same files will not hash the same later.
 - The SHA-256 is printed by the script on the device; it shows the download

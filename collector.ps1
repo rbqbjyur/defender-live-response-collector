@@ -20,8 +20,11 @@
     the run attempted: its outcome, size, bytes copied, SHA-256 and times.
 
     Best effort: anything that can't be read is skipped and counted in the
-    summary; the run never stops on an error. No child processes are started,
-    and the output is left in place for retrieval.
+    summary; the run never stops on an error. It stops only to protect the
+    output or the host: a full disk, or free space below the reserve set in
+    CONFIG. Files whose content isn't on the disk (cloud-only, offline) are not
+    read, so nothing is downloaded. No child processes are started, and the
+    output is left in place for retrieval.
 
 .EXAMPLE
     run collector.ps1
@@ -55,7 +58,7 @@ param()
 
 # ============================== CONFIG ==============================
 
-$CollectorVersion = '2.0.0'
+$CollectorVersion = '2.1.0'
 
 # No script-wide error suppression: every unit of work has its own try/catch,
 # so an error nobody anticipated shows (in the Live Response transcript) rather
@@ -92,6 +95,12 @@ $zipName = "${hostName}_${timestamp}.zip"
 # them, or open .001 in 7-Zip) - so each getfile stays well within its 3 GB and
 # time limits. A zip that fits is left as it is.
 $zipVolumeSize = 1GB
+
+# Free space the run leaves on the output folder's drive. Collection stops, as
+# for a full disk, before a copy would take the drive below it, so the host's
+# own writes (services, event logs) never meet a full drive; a split starts
+# only if a volume fits above it.
+$freeSpaceReserve = 1GB
 
 # The per-file record inside the zip, at its root beside the drive folders: one
 # row per file the run attempted (see $fileRecordColumns for the columns).
@@ -456,8 +465,11 @@ $artefacts = @(
 #   Artefact     the summary row the file or folder belongs to ('User profiles'
 #                for a profile root that couldn't be listed)
 #   Outcome      collected | size changed | incomplete | not accessible
-#                (see Copy-FileToZip) | folder not listed (every other cell
-#                but Detail empty)
+#                (see Copy-FileToZip) | not local (content not on the disk,
+#                not read: Test-FileItemIsNotLocal) | folder not listed |
+#                artefact failed (the row's collection failed as a whole);
+#                for the last two every cell but Artefact, Outcome, Source and
+#                Detail is empty
 #   Source       the file's path on the device, or the folder's
 #   Entry        its path inside the zip ('' when nothing was written)
 #   Size         its size in bytes when opened ('' if it couldn't be opened)
@@ -467,7 +479,7 @@ $artefacts = @(
 #                (Get-FileOwnTime), UTC (ISO 8601, Z); '' where unknown or the
 #                file was never listed (NTFS metafiles)
 #   Detail       the error, for a failure ("access denied" or the error, for a
-#                folder not listed)
+#                folder not listed; why it wasn't read, for a file not local)
 # Empty files and file symbolic links are not attempted and have no row (owner's
 # decision): the record lists what was collected and what couldn't be read. A
 # folder not listed has one row per artefact that met it, as each of those
@@ -498,6 +510,12 @@ function ConvertTo-CsvLine {
     return ($quotedCells -join ',')
 }
 
+# A byte count in GiB for messages, e.g. '1 GiB' or '1.5 GiB'.
+function Format-GibiByte {
+    param([long]$Bytes)
+    return (($Bytes / 1GB).ToString('0.##', [Globalization.CultureInfo]::InvariantCulture) + ' GiB')
+}
+
 # A file time for the per-file record: ISO 8601 in UTC with a trailing Z and
 # 100 ns precision (the file system's own precision); empty when unknown.
 function Format-RecordTime {
@@ -509,14 +527,15 @@ function Format-RecordTime {
 # --- Links and names ---
 
 # True if a folder (a DirectoryInfo from Get-Item or Get-ChildItem) is a
-# junction or symbolic link. Folder links are never followed: on Windows they
-# only duplicate real folders ("All Users", "Default User", the XP
-# compatibility links such as "Local Settings" or "Application Data" inside
-# profiles). PowerShell 5.1 leaves LinkType empty for a link that denies
-# listing to everyone, as Windows' own compatibility links do, so a reparse
-# point whose type can't be read and whose listing is denied counts as a link
-# too. Other reparse points that can be listed (e.g. OneDrive cloud folders)
-# are ordinary folders.
+# junction or symbolic link. Folder links are never followed, as the reference
+# collector doesn't follow them: a link can point outside the searched
+# location, and Windows' own ones duplicate real folders ("All Users",
+# "Default User", the XP compatibility links such as "Local Settings" or
+# "Application Data" inside profiles). PowerShell 5.1 leaves LinkType empty
+# for a link that denies listing to everyone, as Windows' own compatibility
+# links do, so a reparse point whose type can't be read and whose listing is
+# denied counts as a link too. Other reparse points that can be listed (e.g.
+# OneDrive cloud folders) are ordinary folders.
 function Test-FolderItemIsLink {
     param($Item)
     $linkType = $Item.LinkType
@@ -540,12 +559,25 @@ function Test-FolderItemIsLink {
 # never followed: its content would arrive from outside the searched location
 # under a name inside it (the reference collector skips them too). It is left
 # out entirely, like an empty file. Only symbolic links count: a file reparse
-# point of another kind (a OneDrive cloud file, a deduplicated file) is a file
-# to read, and a hard link can't be told from the file itself.
+# point of another kind (a OneDrive file, a deduplicated file) is a file, read
+# unless its content isn't on the disk (Test-FileItemIsNotLocal), and a hard
+# link can't be told from the file itself.
 function Test-FileItemIsSymbolicLink {
     param($Item)
     if (-not ($Item.Attributes -band [System.IO.FileAttributes]::ReparsePoint)) { return $false }
     try { return ($Item.LinkType -eq 'SymbolicLink') } catch { return $false }
+}
+
+# True if a file's content isn't on the disk: a OneDrive Files On-Demand
+# placeholder, or a file moved to offline storage. Reading it would make the
+# provider fetch the content, over the network, and change the host, so it is
+# not read (owner, 2026-10-24); getfile can't fetch it either. Attributes, from
+# the listing: Offline (0x1000), RecallOnOpen (0x40000), RecallOnDataAccess
+# (0x400000; .NET Framework has no names for the last two).
+function Test-FileItemIsNotLocal {
+    param($Item)
+    $notLocalAttributes = 0x1000 -bor 0x40000 -bor 0x400000
+    try { return (([int64]$Item.Attributes -band $notLocalAttributes) -ne 0) } catch { return $false }
 }
 
 # The target of a link item, or '' if it can't be read.
@@ -840,7 +872,9 @@ function Get-ExpectedMissingReason {
 
 # Every ready local drive, for per-drive artefacts: fixed and removable alike,
 # with its file system; network drives and drives that aren't ready (no media,
-# locked) are left out. The system drive is always present and comes first.
+# locked) are left out. The system drive is always present and comes first;
+# if the drive list can't be read, it is searched alone, its file system
+# 'unknown'.
 function Get-LocalDrive {
     $drives = New-Object 'System.Collections.Generic.List[object]'
     try {
@@ -855,19 +889,20 @@ function Get-LocalDrive {
         }
     } catch { $drives.Clear() }   # no drive list at all: the system drive alone, below
     if (-not ($drives | Where-Object { $_.Root -eq $systemDrive })) {
-        $drives.Insert(0, [pscustomobject]@{ Root = $systemDrive; Format = 'NTFS' })   # never lose the system drive
+        $drives.Insert(0, [pscustomobject]@{ Root = $systemDrive; Format = 'unknown' })   # never lose the system drive
     }
     return @($drives | Sort-Object -Property { $_.Root -ne $systemDrive }, Root)
 }
 
 # Drive roots ('C:', 'D:') for a row's Drives field: the system drive only by
-# default, every local drive ('All'), or those formatted NTFS ('NTFS'), from
-# $script:localDrives. The system drive always comes first.
+# default, every local drive ('All'), or those formatted NTFS ('NTFS', which
+# includes a drive whose file system is unknown, so it isn't skipped unseen),
+# from $script:localDrives. The system drive always comes first.
 function Get-DriveRoot {
     param([string]$Kind = 'System')
     if ($Kind -ne 'All' -and $Kind -ne 'NTFS') { return $systemDrive }
     foreach ($drive in $script:localDrives) {
-        if ($Kind -eq 'All' -or $drive.Format -eq 'NTFS') { $drive.Root }
+        if ($Kind -eq 'All' -or $drive.Format -eq 'NTFS' -or $drive.Format -eq 'unknown') { $drive.Root }
     }
 }
 
@@ -881,8 +916,8 @@ function Get-UserProfilePath {
     param([System.Collections.Generic.List[object]]$FoldersNotListed)
     $seenRoots = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
     foreach ($rootName in $profileRoots) {
+        $rootPath = Join-Path $systemDrive $rootName
         try {
-            $rootPath = Join-Path $systemDrive $rootName
             $rootItem = Get-Item -LiteralPath $rootPath -Force -ErrorAction Stop
             if (Test-FolderItemIsLink -Item $rootItem) {
                 # A link whose target can't be read (Windows' compatibility link
@@ -894,7 +929,11 @@ function Get-UserProfilePath {
             if ($seenRoots.Add($rootPath.TrimEnd('\'))) {
                 Get-ChildFolder -Path $rootPath -FoldersNotListed $FoldersNotListed
             }
-        } catch { continue }   # no such root (e.g. no Documents and Settings): nothing to list
+        } catch {
+            # No such root (e.g. no Documents and Settings) is nothing to list;
+            # any other failure is a folder not listed.
+            Add-FolderNotListed -Path $rootPath -ErrorRecords @($_) -FoldersNotListed $FoldersNotListed
+        }
     }
 }
 
@@ -968,22 +1007,40 @@ function Get-FileOwnTime {
     return $times
 }
 
+# True if the free space on the output drive is below $freeSpaceReserve.
+# OutputDrive is a DriveInfo, or $null when the free space couldn't be read at
+# the start (warned about then). A read that fails now counts as not below: a
+# full disk is still caught by the write that fails (Test-DiskFull).
+function Test-BelowFreeSpaceReserve {
+    param($OutputDrive)
+    if (-not $OutputDrive) { return $false }
+    try { return ($OutputDrive.AvailableFreeSpace -lt $freeSpaceReserve) } catch { return $false }
+}
+
 # Copy one file straight into the zip, opening it with shared access so files
 # held open by other processes (e.g. Edge History) can usually still be read.
 # The bytes are hashed as they are copied. LastWriteTimeUtc is the file's own
 # modified time read before the open (Get-FileOwnTime), for the entry's time;
-# $null to read it now (a Literal path).
-# Returns @{ Outcome; SizeWhenOpened; BytesCopied; Sha256; Error; DiskFull }:
+# $null to read it now (a Literal path). OutputDrive: see
+# Test-BelowFreeSpaceReserve, checked before the open and after every block.
+# Returns @{ Outcome; SizeWhenOpened; BytesCopied; Sha256; Error; DiskFull;
+# BelowReserve }:
 #   Outcome  'collected' (every byte of the size when opened),
 #            'size changed' (collected, but a live file grew or shrank meanwhile),
 #            'incomplete' (the read failed part-way: the entry stays in the zip,
 #            incomplete, as Create mode can't remove one) or
 #            'not accessible' (the file could not be opened).
-#   DiskFull $true when the zip can't grow: collection must stop.
+#   DiskFull      $true when the zip can't grow: collection must stop.
+#   BelowReserve  $true when the output drive's free space fell below the
+#                 reserve: collection must stop (the copy is abandoned).
 function Copy-FileToZip {
-    param($Zip, [string]$Path, [string]$EntryName, $LastWriteTimeUtc)
+    param($Zip, [string]$Path, [string]$EntryName, $LastWriteTimeUtc, $OutputDrive)
 
-    $result = @{ Outcome = 'not accessible'; SizeWhenOpened = $null; BytesCopied = [long]0; Sha256 = ''; Error = ''; DiskFull = $false }
+    $result = @{ Outcome = 'not accessible'; SizeWhenOpened = $null; BytesCopied = [long]0; Sha256 = ''; Error = ''; DiskFull = $false; BelowReserve = $false }
+    if (Test-BelowFreeSpaceReserve -OutputDrive $OutputDrive) {
+        $result.BelowReserve = $true
+        return $result
+    }
     $source       = $null
     $destination  = $null
     $entryCreated = $false
@@ -1020,9 +1077,18 @@ function Copy-FileToZip {
             $destination.Write($script:copyBuffer, 0, $bytesRead)
             $null = $hasher.TransformBlock($script:copyBuffer, 0, $bytesRead, $null, 0)
             $result.BytesCopied += $bytesRead
+            if (Test-BelowFreeSpaceReserve -OutputDrive $OutputDrive) {
+                $result.BelowReserve = $true   # the zip is deleted: nothing more to record
+                return $result
+            }
         }
         $null = $hasher.TransformFinalBlock($script:copyBuffer, 0, 0)
         $result.Sha256  = ConvertTo-HexDigest -Hasher $hasher
+        # Closing the entry writes its last compressed block, its sizes and its
+        # CRC: part of the copy, so a failure here is a failed copy, not a
+        # clean-up to ignore.
+        $destination.Dispose()
+        $destination = $null
         $result.Outcome = if ($null -ne $result.SizeWhenOpened -and $result.BytesCopied -ne $result.SizeWhenOpened) { 'size changed' } else { 'collected' }
     } catch {
         $result.Error = Get-OneLineMessage -ErrorRecord $_
@@ -1030,11 +1096,13 @@ function Copy-FileToZip {
             $result.DiskFull = $true
         } elseif ($entryCreated) {
             $result.Outcome = 'incomplete'
-            # The hash of what the entry holds, so the record still describes it.
-            if ($hasher) { try { $null = $hasher.TransformFinalBlock($script:copyBuffer, 0, 0); $result.Sha256 = ConvertTo-HexDigest -Hasher $hasher } catch {} }   # no hash then
+            # The hash of the bytes passed to the entry, so the record still
+            # describes them (already there if only closing the entry failed).
+            if ($hasher -and -not $result.Sha256) { try { $null = $hasher.TransformFinalBlock($script:copyBuffer, 0, 0); $result.Sha256 = ConvertTo-HexDigest -Hasher $hasher } catch {} }   # no hash then
         }
     } finally {
-        # Closing can fail too (e.g. disk full while flushing the entry): never let it escape.
+        # Only after a failure is the entry still open here: its close can fail
+        # again, and must not escape.
         if ($destination) { try { $destination.Dispose() } catch {} }
         if ($source)      { try { $source.Dispose() } catch {} }
         if ($hasher)      { try { $hasher.Dispose() } catch {} }
@@ -1061,7 +1129,8 @@ function New-FileRecordLine {
 }
 
 # Write collection.csv into the zip (UTF-8 without BOM, CRLF), as its last
-# entry. Throws if the zip can't take it (the caller treats that as disk full).
+# entry. Throws if the zip can't take it, closing the entry included (the
+# caller tells a full disk from other failures).
 function Write-FileRecord {
     param($Zip, [string]$EntryName, [string[]]$Lines)
     $entryStream = $null
@@ -1074,7 +1143,11 @@ function Write-FileRecord {
         $writer.NewLine = "`r`n"
         $writer.WriteLine((ConvertTo-CsvLine -Cells $fileRecordColumns))
         foreach ($line in $Lines) { $writer.WriteLine($line) }
-        $writer.Flush()
+        # Disposing the writer closes the entry, which writes its last block:
+        # inside the try, so a failure reaches the caller.
+        $writer.Dispose()
+        $writer      = $null
+        $entryStream = $null
     } finally {
         if ($writer)      { try { $writer.Dispose() } catch {} }
         if ($entryStream) { try { $entryStream.Dispose() } catch {} }
@@ -1128,9 +1201,12 @@ function Get-ArtefactSource {
 #   SizeDifferences       Path, BytesCopied, SizeWhenOpened, ReadError
 #   FileRecordLines       the row's collection.csv lines
 #   CollectedFileCount    files written whole (or as a live file changed)
-#   DiskFull              $true if the zip filled up while collecting this row
+#   ZipEntryCount         zip entries written (collected, size changed, incomplete)
+#   NotLocalFileCount     files not read because their content isn't on the disk
+#   StopReason            '' or why collection must stop: 'Full' (the zip
+#                         can't grow) or 'BelowReserve' (Test-BelowFreeSpaceReserve)
 function Add-ArtefactToZip {
-    param($Zip, [hashtable]$Artefact, [string[]]$UserProfilePaths)
+    param($Zip, [hashtable]$Artefact, [string[]]$UserProfilePaths, $OutputDrive)
 
     $tally = @{ Candidates = 0; Collected = 0; Failed = 0 }
     $countByFolderUnits = @{}   # CountBy 'Folder': folder -> @{ Main; Any } (whether its main / any file was read)
@@ -1140,7 +1216,9 @@ function Add-ArtefactToZip {
     $fileRecordLines  = New-Object 'System.Collections.Generic.List[string]'
     $partialCopyCount   = 0
     $collectedFileCount = 0
-    $diskFull           = $false
+    $zipEntryCount      = 0
+    $notLocalFileCount  = 0
+    $stopReason         = ''
     $followUpScope    = if ($Artefact.FollowUp) { $Artefact.FollowUp } else { 'System' }
 
     :sources foreach ($source in (Get-ArtefactSource -Artefact $Artefact -UserProfilePaths $UserProfilePaths)) {
@@ -1164,18 +1242,29 @@ function Add-ArtefactToZip {
                         $fileTimes        = Get-FileOwnTime -Path $matchedFile.Path
                         $lastWriteTimeUtc = $fileTimes.Modified
                     }
-                    $copy = Copy-FileToZip -Zip $Zip -Path $matchedFile.Path -EntryName $entryName -LastWriteTimeUtc $lastWriteTimeUtc
-                    if ($copy.DiskFull) { $diskFull = $true; break sources }   # the zip can't grow: stop
-                    $wasRead   = ($copy.Outcome -eq 'collected' -or $copy.Outcome -eq 'size changed')
-                    if ($wasRead) { $collectedFileCount++ }
-                    $entryText = if ($copy.Outcome -eq 'not accessible') { '' } else { $entryName }
+                    if ($matchedFile.Item -and (Test-FileItemIsNotLocal -Item $matchedFile.Item)) {
+                        # Not read, so its provider doesn't fetch it (Test-FileItemIsNotLocal).
+                        $copy = @{ Outcome = 'not local'; SizeWhenOpened = $null; BytesCopied = $null; Sha256 = ''
+                                   Error = 'content not on the disk (cloud-only or offline): not read'; DiskFull = $false; BelowReserve = $false }
+                        $notLocalFileCount++
+                    } else {
+                        $copy = Copy-FileToZip -Zip $Zip -Path $matchedFile.Path -EntryName $entryName -LastWriteTimeUtc $lastWriteTimeUtc -OutputDrive $OutputDrive
+                    }
+                    if ($copy.DiskFull)     { $stopReason = 'Full'; break sources }           # the zip can't grow: stop
+                    if ($copy.BelowReserve) { $stopReason = 'BelowReserve'; break sources }   # keep the host's free space: stop
+                    $wasRead      = ($copy.Outcome -eq 'collected' -or $copy.Outcome -eq 'size changed')
+                    $entryWritten = ($wasRead -or $copy.Outcome -eq 'incomplete')
+                    if ($wasRead)      { $collectedFileCount++ }
+                    if ($entryWritten) { $zipEntryCount++ }
+                    $entryText = if ($entryWritten) { $entryName } else { '' }
                     $fileRecordLines.Add((New-FileRecordLine -Artefact $Artefact.Name -Outcome $copy.Outcome -Source $matchedFile.Path -Entry $entryText -Size $copy.SizeWhenOpened -BytesCopied $copy.BytesCopied -Sha256 $copy.Sha256 -FileTimes $fileTimes -Detail $copy.Error))
                     if ($copy.Outcome -eq 'size changed' -or $copy.Outcome -eq 'incomplete') {
                         $readError = if ($copy.Outcome -eq 'incomplete') { $copy.Error } else { '' }
                         $sizeDifferences.Add([pscustomobject]@{ Path = $matchedFile.Path; BytesCopied = $copy.BytesCopied; SizeWhenOpened = $copy.SizeWhenOpened; ReadError = $readError })
                         if ($copy.Outcome -eq 'incomplete') { $partialCopyCount++ }
                     }
-                    if (-not $wasRead) {
+                    # getfile can't fetch a file that isn't on the disk either.
+                    if (-not $wasRead -and $copy.Outcome -ne 'not local') {
                         $unreadableFiles.Add([pscustomobject]@{
                             Path = $matchedFile.Path; Scope = $source.Scope
                             Literal = [bool]$Artefact.Literal; GetFile = [bool]$Artefact.GetFile
@@ -1243,20 +1332,24 @@ function Add-ArtefactToZip {
     return [pscustomobject]@{
         Name = $Artefact.Name; Status = $status; Note = $note; IsUnusualGap = $isUnusualGap
         UnreadableFiles = $unreadableFiles; FoldersNotListed = $foldersNotListed; SizeDifferences = $sizeDifferences
-        FileRecordLines = $fileRecordLines; CollectedFileCount = $collectedFileCount; DiskFull = $diskFull
+        FileRecordLines = $fileRecordLines; CollectedFileCount = $collectedFileCount; ZipEntryCount = $zipEntryCount
+        NotLocalFileCount = $notLocalFileCount; StopReason = $stopReason
     }
 }
 
 # The row result for an artefact whose collection failed as a whole (an error
 # outside every source's own handling): Missing, warned about, with the error
-# named as a folder not listed.
+# named as a folder not listed and in an 'artefact failed' record row.
 function New-FailedArtefactResult {
     param([string]$Name, $ErrorRecord)
+    $reason = Get-OneLineMessage -ErrorRecord $ErrorRecord
     return [pscustomobject]@{
         Name = $Name; Status = 'Missing'; Note = ''; IsUnusualGap = $true
         UnreadableFiles  = @()
-        FoldersNotListed = @([pscustomobject]@{ Path = $Name; Reason = (Get-OneLineMessage -ErrorRecord $ErrorRecord) })
-        SizeDifferences  = @(); FileRecordLines = @(); CollectedFileCount = 0; DiskFull = $false
+        FoldersNotListed = @([pscustomobject]@{ Path = $Name; Reason = $reason })
+        SizeDifferences  = @()
+        FileRecordLines  = @(New-FileRecordLine -Artefact $Name -Outcome 'artefact failed' -Source '' -Entry '' -Size $null -BytesCopied $null -Sha256 '' -FileTimes $null -Detail $reason)
+        CollectedFileCount = 0; ZipEntryCount = 0; NotLocalFileCount = 0; StopReason = ''
     }
 }
 
@@ -1264,18 +1357,29 @@ function New-FailedArtefactResult {
 
 # Open the zip in the first output folder that works. A folder created here but
 # then unusable (e.g. the sensor refuses writes) is removed again if still empty.
-# Returns @{ Zip; ZipPath; Folder } or $null if no folder works.
+# The zip's file stream is opened here and handed to the zip, not left to
+# ZipFile.Open, so MAIN can close it when the zip's own close fails: .NET
+# Framework's ZipArchive.Dispose leaves the stream open when writing the index
+# throws, and the zip then can't be deleted until the process ends (round 2.3).
+# Returns @{ Zip; ZipStream; ZipPath; Folder } or $null if no folder works.
 function Open-OutputZip {
     param([string[]]$CandidateFolders, [string]$ZipName)
     foreach ($candidate in $CandidateFolders) {
         if (-not (Test-Path -LiteralPath (Split-Path -Path $candidate -Parent) -ErrorAction SilentlyContinue)) { continue }
-        $existed = Test-Path -LiteralPath $candidate -ErrorAction SilentlyContinue
+        $existed   = Test-Path -LiteralPath $candidate -ErrorAction SilentlyContinue
+        $zipPath   = Join-Path $candidate $ZipName
+        $zipStream = $null
         try {
-            $null    = New-Item -ItemType Directory -Path $candidate -Force -ErrorAction Stop
-            $zipPath = Join-Path $candidate $ZipName
-            $zip     = [System.IO.Compression.ZipFile]::Open($zipPath, [System.IO.Compression.ZipArchiveMode]::Create)
-            return @{ Zip = $zip; ZipPath = $zipPath; Folder = $candidate }
+            $null      = New-Item -ItemType Directory -Path $candidate -Force -ErrorAction Stop
+            $zipStream = [System.IO.File]::Open($zipPath, [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
+            $zip       = New-Object System.IO.Compression.ZipArchive($zipStream, [System.IO.Compression.ZipArchiveMode]::Create, $false)
+            return @{ Zip = $zip; ZipStream = $zipStream; ZipPath = $zipPath; Folder = $candidate }
         } catch {
+            if ($zipStream) {
+                # The file was created but the zip couldn't be: remove it again.
+                try { $zipStream.Dispose() } catch {}
+                try { Remove-Item -LiteralPath $zipPath -Force -ErrorAction Stop } catch {}
+            }
             if (-not $existed) { try { Remove-Item -LiteralPath $candidate -Force -ErrorAction Stop } catch {} }
         }
     }
@@ -1286,11 +1390,14 @@ function Open-OutputZip {
 # <zip>.001, .002, ... Works from the end so the extra space needed is one
 # volume, never a second copy: the last volume is copied out and cut off the
 # zip, and so on, and what is left (the first volume) is renamed to .001.
+# A split starts only if one volume fits above the free-space reserve on
+# OutputDrive (see Test-BelowFreeSpaceReserve): checked once, before the first
+# cut, as each cut gives back the space the next volume takes.
 # Returns @{ Volumes; Error; ZipCut }: the output files (just the zip if it
 # fits), the error if it failed, and whether the zip had already been cut when
 # it failed (it is then unusable).
 function Split-ZipFile {
-    param([string]$Path, [long]$VolumeSize)
+    param([string]$Path, [long]$VolumeSize, $OutputDrive)
     $result = @{ Volumes = @($Path); Error = ''; ZipCut = $false }
     $zipStream = $null
     try {
@@ -1298,6 +1405,12 @@ function Split-ZipFile {
         if ($length -le $VolumeSize) { return $result }
         $volumeCount = [int][math]::Ceiling($length / $VolumeSize)
         $volumePaths = @(for ($index = 1; $index -le $volumeCount; $index++) { '{0}.{1:D3}' -f $Path, $index })
+        $freeSpace = $null
+        if ($OutputDrive) { try { $freeSpace = $OutputDrive.AvailableFreeSpace } catch { $freeSpace = $null } }
+        if ($null -ne $freeSpace -and $freeSpace - $VolumeSize -lt $freeSpaceReserve) {
+            $result.Error = '{0} has {1} free, less than one volume ({2}) above the reserve ({3})' -f $OutputDrive.Name.TrimEnd('\'), (Format-GibiByte -Bytes $freeSpace), (Format-GibiByte -Bytes $VolumeSize), (Format-GibiByte -Bytes $freeSpaceReserve)
+            return $result
+        }
         $zipStream = [System.IO.File]::Open($Path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::None)
         for ($index = $volumeCount; $index -ge 2; $index--) {
             $volumeStart  = [long]($index - 1) * $VolumeSize
@@ -1323,6 +1436,25 @@ function Split-ZipFile {
         if ($zipStream) { try { $zipStream.Dispose() } catch {} }
     }
     return $result
+}
+
+# Read the finished zip's index back, as a reader would: its entry count and,
+# when the record was written, collection.csv as the last entry. Returns ''
+# when both hold, otherwise what didn't. Reads the central directory only.
+function Test-ZipReadBack {
+    param([string]$Path, [int]$ExpectedEntryCount, [string]$LastEntryName)
+    $zipReader = $null
+    try {
+        $zipReader = [System.IO.Compression.ZipFile]::OpenRead($Path)
+        $entries   = $zipReader.Entries
+        if ($entries.Count -ne $ExpectedEntryCount) { return ('{0} entries where {1} were written' -f $entries.Count, $ExpectedEntryCount) }
+        if ($LastEntryName -and $entries[$entries.Count - 1].FullName -ne $LastEntryName) { return "the last entry is not $LastEntryName" }
+        return ''
+    } catch {
+        return (Get-OneLineMessage -ErrorRecord $_)
+    } finally {
+        if ($zipReader) { try { $zipReader.Dispose() } catch {} }
+    }
 }
 
 # The volume files a split may have written beside a zip (whether or not the
@@ -1363,15 +1495,24 @@ function Get-FileSha256 {
 
 # Print a line and keep it in the run log beside the zip. Until the output
 # folder is known the lines are buffered in $script:logLines, then written out
-# in one go (Start-RunLog). A log that can't be written never affects the run.
+# in one go (Start-RunLog). A log that can't be written never affects the run;
+# the first time it fails, the console says so once ($script:logWriteFailed),
+# before the line itself, so the console's last line stays the run's own.
 function Write-ConsoleAndLog {
     param([string]$Text = '')
-    Write-Output $Text
     if ($script:logPath) {
-        try { [System.IO.File]::AppendAllText($script:logPath, $Text + "`r`n", $script:utf8NoBom) } catch {}
+        try {
+            [System.IO.File]::AppendAllText($script:logPath, $Text + "`r`n", $script:utf8NoBom)
+        } catch {
+            if (-not $script:logWriteFailed) {
+                $script:logWriteFailed = $true
+                Write-Output ('The run log could not be written from here on (' + (Get-OneLineMessage -ErrorRecord $_) + ').')
+            }
+        }
     } else {
         $script:logLines.Add($Text)
     }
+    Write-Output $Text
 }
 
 # Create the run log beside the zip (same name, .log) with everything printed
@@ -1408,6 +1549,27 @@ function Write-WarningSection {
         Write-ConsoleAndLog -Text "  - $($warning.Message)"
         foreach ($detailLine in $warning.Detail) { Write-ConsoleAndLog -Text "      $detailLine" }
     }
+}
+
+# The warning for a run that had to stop (see MAIN): where it stopped, why,
+# what became of the zip, and what to do. Reasons: 'Full' (the output drive
+# is full), 'BelowReserve' (its free space fell below the reserve),
+# 'NotFinished' (the zip's index couldn't be written), 'NotReadable' (the
+# finished zip couldn't be read back). Detail is the error, for the last two.
+function Get-StopMessage {
+    param([string]$StoppedWhile, [string]$Reason, [string]$Detail, [string]$DriveName, [string]$ZipFate)
+    switch ($Reason) {
+        'Full'         { return "Collection stopped while ${StoppedWhile}: $DriveName is full. The partial zip $ZipFate. Free up space on $DriveName and run the collector again." }
+        'BelowReserve' { return "Collection stopped while ${StoppedWhile}: $DriveName has less than $(Format-GibiByte -Bytes $freeSpaceReserve) free, the reserve kept for the host. The partial zip $ZipFate. Free up space on $DriveName and run the collector again." }
+        'NotFinished'  { return "Collection stopped while ${StoppedWhile}: the zip could not be finished ($Detail). The zip $ZipFate. Run the collector again." }
+        default        { return "Collection stopped while ${StoppedWhile}: the finished zip could not be read back ($Detail). The zip $ZipFate. Run the collector again." }
+    }
+}
+
+# The run's last line: when it ended, in UTC, in the banner's form.
+function Write-FinishedLine {
+    Write-ConsoleAndLog -Text ''
+    Write-ConsoleAndLog -Text ('Finished ' + (Get-Date).ToUniversalTime().ToString("yyyy-MM-dd'T'HH:mm:ss'Z'"))
 }
 
 # --- The report ---
@@ -1473,7 +1635,8 @@ function Write-RetrievalCommand {
 }
 
 # Follow-up getfile commands for files this script found but couldn't read and
-# the Defender sensor can retrieve directly - outcome-based: only reads that
+# the Defender sensor may retrieve directly (locked files usually; not files
+# whose content isn't on the disk, which aren't listed) - outcome-based: only reads that
 # actually failed, in collection order (so metafiles first). Metafiles are
 # listed only if flagged GetFile, with no Test-Path (PowerShell can't reliably
 # see them); other files must still exist. Kept lean: each row's FollowUp scope
@@ -1495,7 +1658,7 @@ function Write-FollowUpCommand {
     if ($followUpPaths.Count -eq 0) { return }
     # Bare commands under a title, so the block can be copied and pasted as-is.
     Write-ConsoleAndLog -Text ''
-    Write-ConsoleAndLog -Text 'Additional inaccessible artefacts (locked from PowerShell - retrieve directly in this Live Response session):'
+    Write-ConsoleAndLog -Text 'Additional inaccessible artefacts (could not be read by PowerShell - retrieve directly in this Live Response session):'
     foreach ($followUpPath in $followUpPaths) { Write-ConsoleAndLog -Text "getfile `"$followUpPath`"" }
 }
 
@@ -1512,6 +1675,7 @@ $script:onDiskCasePathCache = @{}                                             # 
 $script:zipEntryNames = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)   # every entry written
 $script:copyBuffer    = New-Object byte[] (1MB)                               # Copy-FileToZip's buffer, allocated once
 $script:localDrives   = @()                                                   # Get-LocalDrive's result, read by Get-DriveRoot
+$script:logWriteFailed = $false                                               # the console has said the run log can't be written
 
 # Banner first, before any status, so the version is the first thing printed.
 # The blank line above it is console-only, to set it off from Live Response's
@@ -1537,17 +1701,30 @@ try {
     Add-Type -AssemblyName System.IO.Compression.FileSystem -ErrorAction Stop
 } catch {
     Write-ConsoleAndLog -Text ('The zip library could not be loaded: ' + (Get-OneLineMessage -ErrorRecord $_))
+    Write-FinishedLine
     return
 }
 
 $output = Open-OutputZip -CandidateFolders $outputFolders -ZipName $zipName
 if (-not $output) {
     Write-ConsoleAndLog -Text ('Could not create the output zip in: ' + ($outputFolders -join '; '))
+    Write-FinishedLine
     return
 }
 $zip     = $output.Zip
 $zipPath = $output.ZipPath
 $logPath = Start-RunLog -ZipPath $zipPath
+
+# The output folder's drive, for the free-space reserve. If its free space
+# can't be read, the reserve can't be kept: said up front.
+$outputDriveName = [System.IO.Path]::GetPathRoot($zipPath).TrimEnd('\')
+$outputDrive     = $null
+try {
+    $outputDrive = [System.IO.DriveInfo]::new($outputDriveName)
+    $null = $outputDrive.AvailableFreeSpace
+} catch {
+    $outputDrive = $null
+}
 
 # Warnings known before collection starts, printed now so they're seen up front.
 try {
@@ -1564,6 +1741,12 @@ if ($null -eq $hostInfo.Build -or $null -eq $hostInfo.Server) {
 if ($output.Folder -ne $outputFolders[0]) {
     Add-CollectorWarning -Message "Output written to a fallback folder ($($output.Folder)), not the Defender sensor's Temp\Collections."
 }
+if (-not $logPath) {
+    Add-CollectorWarning -Message 'The run log could not be created beside the zip: this console is the only record of the run.'
+}
+if (-not $outputDrive) {
+    Add-CollectorWarning -Message "The free space on $outputDriveName could not be read: the $(Format-GibiByte -Bytes $freeSpaceReserve) reserve is not kept."
+}
 if ($script:warnings.Count -gt 0) {
     Write-ConsoleAndLog -Text ''
     Write-WarningSection
@@ -1572,11 +1755,16 @@ Write-ConsoleAndLog -Text ''
 
 # Collect every artefact, one progress line each, then write the per-file
 # record as the zip's last entry. Each row is isolated: a failure skips only
-# that row.
-$rowResults       = New-Object 'System.Collections.Generic.List[object]'
-$fileRecordLines  = New-Object 'System.Collections.Generic.List[string]'
-$rootsNotListed   = New-Object 'System.Collections.Generic.List[object]'
-$diskFullArtefact = ''
+# that row. The run stops early only to protect the output or the host
+# ($stopReason, see Get-StopMessage).
+$rowResults        = New-Object 'System.Collections.Generic.List[object]'
+$fileRecordLines   = New-Object 'System.Collections.Generic.List[string]'
+$rootsNotListed    = New-Object 'System.Collections.Generic.List[object]'
+$stoppedWhile      = ''      # what the run was doing when it had to stop
+$stopReason        = ''      # why, or '' if it didn't stop
+$stopDetail        = ''      # the error behind a NotFinished or NotReadable stop
+$fileRecordWritten = $false
+$zipCloseError     = $null
 try {
     $userProfilePaths = @(Get-UserProfilePath -FoldersNotListed $rootsNotListed)
     # A profile root that couldn't be listed belongs to no artefact row: its
@@ -1592,34 +1780,71 @@ try {
         Write-ConsoleAndLog -Text ("[{0:D2}/{1}] Collecting {2}" -f $progressIndex, $artefacts.Count, $artefact.Name)
         $rowResult = $null
         try {
-            $rowResult = Add-ArtefactToZip -Zip $zip -Artefact $artefact -UserProfilePaths $userProfilePaths
+            $rowResult = Add-ArtefactToZip -Zip $zip -Artefact $artefact -UserProfilePaths $userProfilePaths -OutputDrive $outputDrive
         } catch {
             $rowResult = New-FailedArtefactResult -Name $artefact.Name -ErrorRecord $_
         }
         $rowResults.Add($rowResult)
         foreach ($line in $rowResult.FileRecordLines) { $fileRecordLines.Add($line) }
-        if ($rowResult.DiskFull) { $diskFullArtefact = $artefact.Name; break }
+        if ($rowResult.StopReason) {
+            $stoppedWhile = "collecting $($artefact.Name)"
+            $stopReason   = $rowResult.StopReason
+            break
+        }
     }
-    if (-not $diskFullArtefact) {
+    if (-not $stopReason) {
         try {
             Write-FileRecord -Zip $zip -EntryName $fileRecordName -Lines $fileRecordLines
+            $fileRecordWritten = $true
         } catch {
-            if (Test-DiskFull -ErrorRecord $_) { $diskFullArtefact = $fileRecordName }
-            else { Add-CollectorWarning -Message ("$fileRecordName could not be written into the zip (" + (Get-OneLineMessage -ErrorRecord $_) + ').') }
+            if (Test-DiskFull -ErrorRecord $_) {
+                $stoppedWhile = "writing $fileRecordName"
+                $stopReason   = 'Full'
+            } else {
+                Add-CollectorWarning -Message ("$fileRecordName could not be written into the zip (" + (Get-OneLineMessage -ErrorRecord $_) + ').')
+            }
         }
     }
 } finally {
-    if ($zip) { try { $zip.Dispose() } catch {} }   # writes the zip's index; can fail if the disk is full
+    # Disposing the zip writes its index (the central directory): a failure
+    # leaves an unusable zip, so it is kept and handled below, never ignored.
+    # The zip then leaves its file open (see Open-OutputZip): close it, so the
+    # zip can be deleted and nothing is written to it when the process ends.
+    try {
+        $zip.Dispose()
+    } catch {
+        $zipCloseError = $_
+        try { $output.ZipStream.Dispose() } catch {}
+    }
+}
+if (-not $stopReason -and $zipCloseError) {
+    $stoppedWhile = 'finishing the zip'
+    $stopReason   = if (Test-DiskFull -ErrorRecord $zipCloseError) { 'Full' } else { 'NotFinished' }
+    $stopDetail   = Get-OneLineMessage -ErrorRecord $zipCloseError
+}
+# Read the finished zip back before anything is split, hashed or offered for
+# getfile: every entry written, and the record last.
+if (-not $stopReason) {
+    $zipEntriesWritten = [int]($rowResults | Measure-Object -Property ZipEntryCount -Sum).Sum
+    if ($fileRecordWritten) { $zipEntriesWritten++ }
+    $lastEntryName  = if ($fileRecordWritten) { $fileRecordName } else { '' }
+    $readBackResult = Test-ZipReadBack -Path $zipPath -ExpectedEntryCount $zipEntriesWritten -LastEntryName $lastEntryName
+    if ($readBackResult) {
+        $stoppedWhile = 'checking the finished zip'
+        $stopReason   = 'NotReadable'
+        $stopDetail   = $readBackResult
+    }
 }
 
-# Disk full: the zip is partial (and its index may not have been written), so it
-# is useless. Delete it, tell the analyst, and stop - they free space and re-run.
-if ($diskFullArtefact) {
+# A run that had to stop leaves no usable zip (a partial or unreadable zip is
+# worse than none): delete it, tell the analyst, and stop.
+if ($stopReason) {
     Remove-OutputFile -Path $zipPath
     $zipFate = if (Test-Path -LiteralPath $zipPath -ErrorAction SilentlyContinue) { "could not be deleted and is unusable: $zipPath" } else { 'was deleted' }
-    Add-CollectorWarning -Message "Collection stopped while collecting ${diskFullArtefact}: $systemDrive is full. The partial zip $zipFate. Free up space on $systemDrive and run the collector again."
+    Add-CollectorWarning -Message (Get-StopMessage -StoppedWhile $stoppedWhile -Reason $stopReason -Detail $stopDetail -DriveName $outputDriveName -ZipFate $zipFate)
     Write-ConsoleAndLog -Text ''
     Write-WarningSection
+    Write-FinishedLine
     return
 }
 
@@ -1629,7 +1854,7 @@ try { $zipBytes = (Get-Item -LiteralPath $zipPath -Force -ErrorAction Stop).Leng
 # Split a large zip into volumes. If it fails before the zip was cut, the whole
 # zip is kept (any volumes already written are removed); once cut, nothing usable
 # is left, so everything goes and the analyst runs again - as for a full disk.
-$split = Split-ZipFile -Path $zipPath -VolumeSize $zipVolumeSize
+$split = Split-ZipFile -Path $zipPath -VolumeSize $zipVolumeSize -OutputDrive $outputDrive
 $outputFiles = @($split.Volumes)
 if ($split.Error) {
     $writtenVolumes = @(Get-WrittenVolume -ZipPath $zipPath)
@@ -1641,6 +1866,7 @@ if ($split.Error) {
         Add-CollectorWarning -Message "Splitting the zip into volumes failed part-way ($($split.Error)). The zip and its volumes $fate. Run the collector again."
         Write-ConsoleAndLog -Text ''
         Write-WarningSection
+        Write-FinishedLine
         return
     }
     Add-CollectorWarning -Message "The zip could not be split into volumes ($($split.Error)) and was kept whole."
@@ -1681,6 +1907,10 @@ if ($foldersNotListed.Count -gt 0) {
 if ($partialCopyCount -gt 0) {
     Add-CollectorWarning -Message ("{0} copy(ies) failed part-way and are incomplete in the zip (named under 'Copies whose size differs')." -f $partialCopyCount)
 }
+$notLocalCount = [int]($rowResults | Measure-Object -Property NotLocalFileCount -Sum).Sum
+if ($notLocalCount -gt 0) {
+    Add-CollectorWarning -Message ("{0} file(s) whose content isn't on the disk (cloud-only or offline) were not read, so nothing was downloaded (Outcome 'not local' in $fileRecordName)." -f $notLocalCount)
+}
 # Unusual gaps (see Add-ArtefactToZip), one per line, in summary order.
 $unusualGaps = @($rowResults | Where-Object { $_.IsUnusualGap } | ForEach-Object { "$($_.Name) ($($_.Status))" })
 if ($unusualGaps.Count -gt 0) { Add-CollectorWarning -Message 'Unusual gaps:' -Detail $unusualGaps }
@@ -1697,3 +1927,4 @@ Write-ConsoleAndLog -Text ''
 Write-ConsoleAndLog -Text "Collected $collectedCount files total$zipSizeText"
 Write-RetrievalCommand -OutputFiles $outputFiles -OutputHashes $outputHashes -LogPath $logPath
 Write-FollowUpCommand -UnreadableFiles @($rowResults | ForEach-Object { $_.UnreadableFiles })
+Write-FinishedLine

@@ -4,6 +4,42 @@ Notable changes to `collector.ps1`. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 2.1.0 - 2026-10-24
+
+### Added
+- The closed zip is read back (entry count, `collection.csv` last) before it
+  is split, hashed or offered for `getfile`.
+- A free-space reserve (1 GiB, CONFIG): collection stops, as for a full disk,
+  before the output drive would go below it; a split starts only if a volume
+  fits above it.
+- Files whose content isn't on the disk (OneDrive cloud-only, offline) are not
+  read, so nothing is downloaded: `not local` in `collection.csv`, counted as
+  not accessible, and warned about.
+- `artefact failed` row in `collection.csv` for an artefact whose collection
+  fails as a whole.
+- A closing `Finished <UTC>` line in the console and run log.
+- Warnings when the run log can't be created or the output drive's free space
+  can't be read; one console line when the run log stops being writable.
+
+### Changed
+- The `getfile` follow-up heading reads "could not be read by PowerShell"
+  (was "locked from PowerShell").
+- A drive whose file system can't be read shows as `unknown` (was assumed
+  NTFS).
+
+### Fixed
+- A failure while closing a zip entry or the zip itself (e.g. disk full while
+  writing the index) was ignored: the entry was recorded as collected, and a
+  zip that couldn't be opened was hashed and offered for `getfile`. The entry
+  is now `incomplete`; a zip that can't be finished is deleted, with a
+  warning, as for a full disk.
+- A profile root that exists but can't be read was skipped silently; it is
+  now a folder not listed.
+- On a full disk the partial zip couldn't be deleted: its file stayed open
+  until the run ended, kept the drive full, and the write attempted at exit
+  started Windows Error Reporting (`wermgr.exe`, a report in the WER queue).
+  The file is now closed and the zip deleted.
+
 ## 2.0.0 - 2026-10-22
 
 The zip's layout changes: `collection.csv` joins the drive folders at its
