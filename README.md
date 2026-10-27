@@ -153,8 +153,12 @@ getfile "C:\ProgramData\Microsoft\Windows Defender Advanced Threat Protection\Te
   collected or found but not readable, with its outcome (`collected`,
   `size changed`, `incomplete`, `not accessible`, `not local`), size, bytes
   copied, SHA-256, times and, for a failure, the error; every folder that
-  couldn't be listed (`folder not listed`, with the reason); and any
-  artefact whose collection failed as a whole (`artefact failed`).
+  couldn't be listed (`folder not listed`, with the reason); any artefact
+  whose collection failed as a whole (`artefact failed`); and, in a partial
+  collection, the artefacts the run didn't reach (`not collected`).
+- `getfile` lines are printed only for a complete output: the whole zip, or
+  every one of its volumes. A run that stopped to keep the free-space reserve
+  prints none (see [How it works](#how-it-works)).
 
 ## What it collects
 
@@ -164,7 +168,9 @@ NTFS metafiles that open the summary are covered under
 and counted.
 
 - `<user>` is every folder under `C:\Users` (and, on XP-era layouts,
-  `C:\Documents and Settings`).
+  `C:\Documents and Settings`). A profile the registry's ProfileList places
+  elsewhere (e.g. on another drive) is not searched; it is named under
+  Warnings.
 - `<sysprof>` is `C:\Windows\System32\config\systemprofile` (the SYSTEM
   account). Service accounts are not `<user>`; their locations are listed
   explicitly.
@@ -250,8 +256,13 @@ list (registry transaction logs excepted).
 - **Best effort.** Anything that can't be read is skipped and counted in the
   summary; the run never stops on an error, except to protect the output or
   the host: a full system drive, free space below the 1 GiB reserve, a zip
-  that can't be finished or read back, or a split that fails part-way. It
-  then deletes the partial output and asks you to run it again.
+  that can't be finished or read back, or a split that fails and can't be
+  undone. It then deletes the output and asks you to run it again, with one
+  exception: stopped to keep the reserve, the zip of what was collected until
+  then is finished, read back and kept, with `collection.csv` naming the
+  artefacts not reached (`not collected`, and *Not collected* in the
+  summary). It is a partial collection: the Warnings give its path; no
+  `getfile` line and no SHA-256 are printed for it.
 - **Checked before it is offered.** Once the zip is closed it is read back:
   every entry written must be in its index, with `collection.csv` last.
   Only then is it split, hashed and printed for `getfile`.
@@ -266,7 +277,8 @@ list (registry transaction logs excepted).
   SYSTEM, a fallback output folder, folders that couldn't be listed, copies
   that failed part-way, a zip that couldn't be split into volumes, a file over
   `getfile`'s 3 GB limit, a SHA-256 that couldn't be calculated, files not
-  read because their content isn't on the disk, and a run that had to stop.
+  read because their content isn't on the disk, user profiles outside the
+  folders searched, and a run that had to stop.
 - **Fail closed.** A folder that exists but can't be listed counts as *Not
   accessible*, never *Missing*, and is named under the summary. A copy that
   fails part-way stays in the zip, incomplete (a zip can't drop an entry once
@@ -294,7 +306,11 @@ list (registry transaction logs excepted).
 - **Split volumes.** A zip over 1 GiB is split in place at the end into
   standard split volumes, `<name>.zip.001`, `.002`, ... (a byte split of the
   one zip, all but the last exactly 1 GiB). Splitting needs free space for one
-  volume, not a second copy. A zip up to 1 GiB stays a single `.zip`.
+  volume, not a second copy. Each volume's length on disk is checked before
+  that part is cut off the zip; a volume (or the final rename) that fails is
+  tried once more, and if that fails too the split is undone and the zip,
+  read back again, is offered whole. The output is always every volume or the
+  whole zip. A zip up to 1 GiB stays a single `.zip`.
 - **Output location.** A `Collections` folder under the Defender for Endpoint
   sensor's own Temp folder,
   `%SystemDrive%\ProgramData\Microsoft\Windows Defender Advanced Threat Protection\Temp\Collections\`,
@@ -307,7 +323,8 @@ list (registry transaction logs excepted).
   `<HOSTNAME>_<UTC timestamp>Z.zip` (or its volumes) and a `.log` of the same
   name with the run's console output. The collector doesn't delete its output.
 - **Footprint.** Writes the output folder, the zip (or its volumes) and its
-  log, leaving at least 1 GiB free on the drive; nothing is downloaded or
+  log, and stops collecting once less than 1 GiB is free on the drive (checked
+  before each file and after each 1 MB copied); nothing is downloaded or
   installed, and no child processes are started.
 - **Live Response limits.** `getfile` retrieves up to 3 GB per file, and slow
   links can time out first; `run` commands time out after 30 minutes. Split
@@ -320,12 +337,22 @@ list (registry transaction logs excepted).
 - **Not accessible:** the file (or a folder holding it) exists but could not
   be read.
 - **Missing:** not present on this host.
+- **Failed:** the artefact's collection failed as a whole (the error is in
+  `collection.csv`); always under Warnings.
+- **Not collected:** the run stopped to keep the free-space reserve before
+  reaching it; the artefact it stopped in is noted *(the run stopped here)*,
+  and the file it was copying then is `incomplete` in `collection.csv` but
+  not counted in the status.
 
 A note in its own column explains a gap that is normal for this host: for
 Missing, the reason (e.g. "normal for Windows Server" for Prefetch, "not on
 this Windows version" for legacy-only artefacts); for files that are normally
 locked, **(requires NTFS parser)** (see
-[What it can't collect](#what-it-cant-collect)). A Missing status without a note
+[What it can't collect](#what-it-cant-collect)), only when at least one file
+failed the way that lock does (held by another process; for the NTFS
+metafiles, access denied) and every file that couldn't be opened did. Any other failure, such as a file gone
+before it was opened or access denied to an account other than SYSTEM, leaves
+the gap unexplained, under Warnings. A Missing status without a note
 is listed under Warnings only if the artefact should exist on this host (e.g.
 event logs, or Prefetch on a workstation); many artefacts may simply be absent
 (e.g. PowerShell transcripts) and are not warned about. A folder that couldn't

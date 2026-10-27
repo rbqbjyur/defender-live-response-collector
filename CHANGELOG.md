@@ -4,6 +4,45 @@ Notable changes to `collector.ps1`. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 2.2.0 - 2026-10-27
+
+### Added
+- A warning naming user profiles that the registry's ProfileList places
+  outside the folders searched for profiles (they are not searched), or saying
+  that ProfileList couldn't be read.
+- `not collected` rows in `collection.csv`, and the *Not collected* status in
+  the summary, for artefacts a run that stopped to keep the reserve didn't
+  reach.
+
+### Changed
+- A run that stops to keep the free-space reserve keeps the zip of what it
+  collected: finished with `collection.csv`, read back and named in the
+  Warnings as a partial collection, with no `getfile` line and no SHA-256 (it
+  was deleted). The file being copied is `incomplete`; the artefact it stopped in
+  is noted "(the run stopped here)".
+- `getfile` lines are printed only for a complete output: the whole zip or
+  every volume.
+- Splitting: each volume's length on disk is checked before it is cut off the
+  zip; a volume or the final rename that fails is tried once more after
+  2 seconds; if that fails, the split is undone and the zip, read back again,
+  is kept whole. Only a split that can't be undone deletes the output (it
+  always did once the zip had been cut).
+- The "(requires NTFS parser)" note applies only when at least one file
+  failed as the expected lock does (a sharing violation; access denied for
+  the NTFS metafiles) and every file that couldn't be opened did; any other
+  failure is an unusual gap.
+- An artefact whose collection fails as a whole reads *Failed* in the summary
+  (was *Missing*).
+- Error text in the warnings, the lists under the summary and
+  `collection.csv`'s Detail is the underlying error's own message, without
+  PowerShell's `Exception calling "..." with "N" argument(s):` wrapper.
+
+### Fixed
+- A failed split deleted every `<zip>.NNN` file beside the zip, including any
+  this run hadn't created; it now deletes only its own.
+- A full disk while splitting was reported as the system drive being full; it
+  names the output drive.
+
 ## 2.1.0 - 2026-10-24
 
 ### Added
