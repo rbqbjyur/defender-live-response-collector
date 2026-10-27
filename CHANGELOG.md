@@ -4,6 +4,12 @@ Notable changes to `collector.ps1`. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 2.2.1 - 2026-10-27
+
+### Changed
+- The size on the "Collected N files" line is labelled as the zip's
+  (`MB compressed`).
+
 ## 2.2.0 - 2026-10-27
 
 ### Added

@@ -61,7 +61,7 @@ param()
 
 # ============================== CONFIG ==============================
 
-$CollectorVersion = '2.2.0'
+$CollectorVersion = '2.2.1'
 
 # No script-wide error suppression: every unit of work has its own try/catch,
 # so an error nobody anticipated shows (in the Live Response transcript) rather
@@ -2296,7 +2296,7 @@ Write-WarningSection -ShowNone
 Write-ArtefactSummary -RowResults $rowResults
 Write-GapList -FoldersNotListed $foldersNotListed -SizeDifferences $sizeDifferences
 
-$zipSizeText = if ($null -ne $zipBytes) { " ($([math]::Round($zipBytes / 1MB, 2)) MB)" } else { '' }
+$zipSizeText = if ($null -ne $zipBytes) { " ($([math]::Round($zipBytes / 1MB, 2)) MB compressed)" } else { '' }
 Write-ConsoleAndLog -Text ''
 if ($isPartialCollection) {
     Write-ConsoleAndLog -Text "Collected $collectedCount files before the run stopped$zipSizeText"

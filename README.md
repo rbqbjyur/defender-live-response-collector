@@ -33,19 +33,9 @@ it open, says exactly what it couldn't, and moves on. For a comprehensive
 collection, including locked files and raw NTFS artefacts, use a full
 collector such as KAPE or the Velociraptor Offline Collector.
 
-<table>
-  <tr>
-    <td><img src="docs/images/end-of-run.webp" alt="Console: the end of a run - the Warnings section, the artefact summary with a status and, where a gap is normal for the host, its reason for each of the 31 artefacts, the folders that could not be listed, the number of files collected, the getfile command for the zip, its SHA-256, the getfile command for the run log, and getfile commands for the locked files the Defender sensor can fetch ($MFT, the system hives, the logged-on user's hives)"></td>
-    <td><img src="docs/images/run-log.webp" alt="Notepad: the run log beside the zip - the banner with the collector's version, the host and the UTC start time, the OS and the drives searched, the Warnings section and the 31 progress lines, one per artefact"></td>
-  </tr>
-  <tr>
-    <td><img src="docs/images/zip-layout.webp" alt="Explorer: the zip's top level: collection.csv, the per-file record, beside one folder per drive searched (C, and F for a second drive's Recycle Bin)"></td>
-    <td><img src="docs/images/zip-layout-c.webp" alt="Explorer: inside the zip's C folder, the original paths: $Recycle.Bin, ProgramData, Users and Windows"></td>
-  </tr>
-</table>
+![Live Response console: connect, run collector.ps1 and Live Response's transcript line, then the collector's banner (its version, the host and the UTC start time, the OS and the drives searched) and its 31 progress lines, one per artefact](docs/images/live-response-run.webp)
 
-A run as an administrator on a test machine (Live Response runs it as SYSTEM,
-so its warning that the run isn't SYSTEM doesn't appear there).
+A run in a Live Response session (Windows 11 Enterprise 24H2, as SYSTEM).
 
 ## Table of contents
 
@@ -333,6 +323,11 @@ list (registry transaction logs excepted).
 
 ## Reading the summary
 
+![Console: the end of a run - the Warnings section, the artefact summary with a status and, where a gap is normal for the host, its reason for each of the 31 artefacts, the folders that could not be listed, the number of files collected, the getfile command for the zip, its SHA-256, the getfile command for the run log, and getfile commands for the locked files the Defender sensor can fetch ($MFT, the system hives, the logged-on user's hives)](docs/images/end-of-run.webp)
+
+The end of a run as an administrator on a test machine (Live Response runs it
+as SYSTEM, so its warning that the run isn't SYSTEM doesn't appear there).
+
 - **N collected:** copied into the zip.
 - **Not accessible:** the file (or a folder holding it) exists but could not
   be read.
@@ -366,6 +361,17 @@ an artefact whose only files are empty reads *Missing*. File symbolic links
 are not counted either.
 
 ## What the output shows
+
+<table>
+  <tr>
+    <td><img src="docs/images/zip-layout.webp" alt="Explorer: the zip's top level: collection.csv, the per-file record, beside one folder per drive searched (C, and F for a second drive's Recycle Bin)"></td>
+    <td><img src="docs/images/zip-layout-c.webp" alt="Explorer: inside the zip's C folder, the original paths: $Recycle.Bin, ProgramData, Users and Windows"></td>
+  </tr>
+</table>
+
+![Notepad: the run log beside the zip - the banner with the collector's version, the host and the UTC start time, the OS and the drives searched, the Warnings section and the 31 progress lines, one per artefact](docs/images/run-log.webp)
+
+The zip in Explorer and the run log in Notepad, from the test machine's run.
 
 - The zip holds the files as they were read during the run, at that point in
   time, under their original paths. The SHA-256 printed with it identifies
