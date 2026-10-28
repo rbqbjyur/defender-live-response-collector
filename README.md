@@ -323,10 +323,10 @@ list (registry transaction logs excepted).
 
 ## Reading the summary
 
-![Console: the end of a run - the Warnings section, the artefact summary with a status and, where a gap is normal for the host, its reason for each of the 31 artefacts, the folders that could not be listed, the number of files collected, the getfile command for the zip, its SHA-256, the getfile command for the run log, and getfile commands for the locked files the Defender sensor can fetch ($MFT, the system hives, the logged-on user's hives)](docs/images/end-of-run.webp)
+![Live Response console: the end of the run - the Warnings section with one unusual gap (BITS, 7 collected and 3 not accessible), the artefact summary with a status and, where a gap is normal for the host, its reason for each of the 31 artefacts, the number of files collected, the getfile command for the zip, its SHA-256 and the getfile command for the run log](docs/images/live-response-summary.webp)
 
-The end of a run as an administrator on a test machine (Live Response runs it
-as SYSTEM, so its warning that the run isn't SYSTEM doesn't appear there).
+The end of the same Live Response run, from 2.2.0 (since 2.2.1 the size reads
+"MB compressed").
 
 - **N collected:** copied into the zip.
 - **Not accessible:** the file (or a folder holding it) exists but could not
