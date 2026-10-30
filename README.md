@@ -157,13 +157,13 @@ NTFS metafiles that open the summary are covered under
 [What it can't collect](#what-it-cant-collect)). Anything locked is skipped
 and counted.
 
-- `<user>` is every folder under `C:\Users` (and, on XP-era layouts,
-  `C:\Documents and Settings`). A profile the registry's ProfileList places
-  elsewhere (e.g. on another drive) is not searched; it is named under
-  Warnings.
-- `<sysprof>` is `C:\Windows\System32\config\systemprofile` (the SYSTEM
-  account). Service accounts are not `<user>`; their locations are listed
-  explicitly.
+- `%UserProfile%` stands for every folder under `%SystemDrive%\Users` (and,
+  on XP-era layouts, `%SystemDrive%\Documents and Settings`), not only the
+  running account's. A profile the registry's ProfileList places elsewhere
+  (e.g. on another drive) is not searched; it is named under Warnings.
+- Service accounts (SYSTEM's `%SystemRoot%\System32\config\systemprofile`,
+  LocalService, NetworkService) are not `%UserProfile%`; their locations are
+  listed explicitly.
 - `<profile>` is any browser profile folder.
 - Within each artefact, locations run from current Windows to legacy forms and
   then `Windows.old`.
@@ -174,6 +174,11 @@ and counted.
 - Empty (0-byte) files and file symbolic links are left out of the zip, of
   `collection.csv` and of every count.
 - Paths are resolved from `%SystemDrive%`, so non-`C:` installs work too.
+  `%SystemRoot%` and `%ProgramData%` in the table stand for `%SystemDrive%\Windows`
+  and `%SystemDrive%\ProgramData`, the same folders on a standard install:
+  the script keeps every location relative to a drive root, one form for the
+  system drive and for the per-drive artefacts alike, so a Windows folder
+  installed under another name is not searched.
 - Per-drive artefacts (Recycle Bin, and the NTFS metafiles under
   [What it can't collect](#what-it-cant-collect)) are taken from every local
   drive, fixed or removable (NTFS, FAT or exFAT), e.g. `C:`, `D:` and a USB
@@ -184,34 +189,34 @@ and counted.
 
 | Artefact | Location |
 |---|---|
-| Application Compatibility | `C:\Windows\AppCompat\Programs\Amcache.hve`<br>`C:\Windows\appcompat\pca\*` (Windows 11 22H2+)<br>`C:\Windows\AppCompat\Programs\RecentFileCache.bcf` (Windows 7)<br>`C:\System Volume Information\Syscache.hve` (Windows 7 / Server 2008 R2)<br>`C:\Windows.old\Windows\AppCompat\Programs\{Amcache.hve,RecentFileCache.bcf}`<br>hives with their `.LOG1`/`.LOG2` |
-| BITS | `C:\ProgramData\Microsoft\Network\Downloader\` (recursive) |
-| Defender Logs | `C:\ProgramData\Microsoft\Windows Defender\Support\` (recursive)<br>`C:\ProgramData\Microsoft\Windows Defender\Scans\History\Service\DetectionHistory\` (recursive)<br>`C:\ProgramData\Microsoft\Windows Defender\Scans\History\Service\Detections.log`<br>`C:\Windows\Temp\MpCmdRun.log`<br>`C:\ProgramData\Microsoft\Microsoft AntiMalware\Support\` (recursive; older Defender / SCEP)<br>`C:\Windows.old\Windows\Temp\MpCmdRun.log` |
-| Event Logs | `C:\Windows\System32\winevt\logs\*.evtx`<br>`C:\Windows\System32\config\*.evt` (XP)<br>`C:\Windows.old\Windows\System32\winevt\logs\*.evtx` |
-| Firewall Log | `C:\Windows\System32\LogFiles\Firewall\pfirewall.*`<br>`C:\Windows.old\Windows\System32\LogFiles\Firewall\pfirewall.*` |
-| Group Policy | `C:\Windows\System32\GroupPolicy\` (recursive)<br>`C:\ProgramData\Microsoft\Group Policy\History\` (recursive; cached domain GPOs)<br>`<user>\AppData\Local\Microsoft\Group Policy\History\` (recursive)<br>`C:\Windows.old\Windows\System32\GroupPolicy\` `*.ini`, `*.pol` and `*\Scripts\` (recursive) |
-| Prefetch | `C:\Windows\Prefetch\*.pf`<br>`C:\Windows.old\Windows\Prefetch\*.pf` |
-| Registry Hives (system) | `C:\Windows\System32\config\{SAM,SECURITY,SOFTWARE,SYSTEM}`<br>`C:\Windows\System32\config\RegBack\{SAM,SECURITY,SOFTWARE,SYSTEM,SYSTEM1}`<br>`C:\System Volume Information\_restore*\RP*\snapshot\_REGISTRY_*` (XP restore points)<br>`C:\Windows.old\Windows\System32\config\` and `...\config\RegBack\`, same hives<br>each with its `.LOG1`/`.LOG2` |
-| Restore Point Logs | `C:\System Volume Information\_restore*\RP*\rp.log` (XP) |
-| SCCM Client Logs | `C:\Windows\CCM\Logs\*` |
-| Scheduled Tasks | `C:\Windows\{System32,SysWOW64}\Tasks\` (recursive)<br>`<user>\AppData\Local\Microsoft\Windows\PowerShell\ScheduledJobs\` (recursive)<br>`C:\Windows\{System32,SysWOW64}\config\systemprofile\AppData\Local\Microsoft\Windows\PowerShell\ScheduledJobs\` (recursive)<br>`C:\Windows\Tasks\*.job`, `C:\Windows\SchedLgU.txt` (legacy)<br>`C:\Windows.old\Windows\System32\Tasks\` (recursive), `C:\Windows.old\Windows\Tasks\*.job`, `C:\Windows.old\Windows\SchedLgU.txt` |
-| SetupAPI | `C:\Windows\INF\setupapi*.log`<br>`C:\Windows\setupapi.log` (XP)<br>`C:\Windows.old\Windows\INF\setupapi*.log` |
-| SRUM | `C:\Windows\System32\SRU\` (recursive: `SRUDB.dat` and its ESE logs)<br>`C:\Windows.old\Windows\System32\SRU\` (recursive) |
-| User Access Logging (SUM) | `C:\Windows\System32\LogFiles\Sum\` (recursive; Windows Server) |
-| Browser History | `<user>\AppData\Local\Microsoft\{Edge,Edge Beta,Edge Dev,Edge SxS}\User Data\<profile>\History*`<br>`<user>\AppData\Local\Google\{Chrome,Chrome Beta,Chrome Dev,Chrome SxS}\User Data\<profile>\History*`<br>`<user>\AppData\Local\{Chromium,Vivaldi,Supermium,WaveBrowser}\User Data\<profile>\History*`<br>`<user>\AppData\Local\BraveSoftware\Brave-Browser\User Data\<profile>\History*`<br>`<user>\AppData\Local\Yandex\YandexBrowser\User Data\<profile>\History*`<br>`<user>\AppData\Local\CocCoc\Browser\User Data\<profile>\History*`<br>`<user>\AppData\Local\Tencent\QQBrowser\User Data\<profile>\History*`<br>`<user>\AppData\Local\Palo Alto Networks\PrismaAccessBrowser\User Data\<profile>\History*`<br>`<user>\AppData\Local\Packages\TheBrowserCompany.Arc_ttt1ap7aakyb4\LocalCache\Local\Arc\User Data\<profile>\History*`<br>`<user>\AppData\Roaming\Opera Software\Opera Stable\History*` and `...\Opera Stable\<profile>\History*`<br>`<user>\AppData\Roaming\360se6\User Data\<profile>\360History*`<br>`<user>\AppData\Roaming\Mozilla\Firefox\Profiles\<profile>\places.sqlite*`<br>`<sysprof>\AppData\Local\` paths for Chrome (all channels), Chromium, Prisma Access, Supermium and Wave<br>`<user>\AppData\Local\Microsoft\Windows\WebCache\*` (IE 10/11, legacy Edge)<br>`index.dat` under `<user>\AppData\Local\Microsoft\Windows\{History,IEDownloadHistory}\` (recursive; IE 9 and earlier)<br>`<user>\AppData\Roaming\Mozilla\Firefox\Profiles\<profile>\downloads.sqlite*` (Firefox before v26)<br>`<user>\AppData\Roaming\Opera\Opera\{global_history.dat,typed_history.xml}` (Opera 12 and earlier)<br>`<user>\AppData\Roaming\Apple Computer\Safari\History.plist` (Safari for Windows)<br>XP: `<user>\Local Settings\Application Data\` paths for Chrome (all channels), Chromium and Prisma Access; `<user>\Application Data\` paths for Supermium, Firefox (incl. `downloads.sqlite*`), Opera 12 and Safari; `index.dat` under `<user>\Local Settings\History\History.IE5\` (recursive) |
-| File History Catalogs | `<user>\AppData\Local\Microsoft\Windows\FileHistory\Configuration\Catalog*.edb` |
-| JumpLists | `<user>\AppData\Roaming\Microsoft\Windows\Recent\AutomaticDestinations\*.automaticDestinations-ms`<br>`<user>\AppData\Roaming\Microsoft\Windows\Recent\CustomDestinations\*.customDestinations-ms` |
-| LNK | `<user>\AppData\Roaming\Microsoft\Windows\Recent\*.lnk`<br>`<user>\AppData\Roaming\Microsoft\Office\Recent\` (recursive)<br>`<user>\Desktop\*.lnk`<br>`<user>\AppData\Roaming\Microsoft\Windows\Start Menu\Programs\*.lnk`<br>`C:\ProgramData\Microsoft\Windows\Start Menu\Programs\*.lnk`<br>`<user>\Recent\` (recursive; XP)<br>`C:\System Volume Information\_restore*\RP*\*.lnk` (XP restore points) |
-| .NET CLR Usage Logs | `<user>\AppData\Local\Microsoft\CLR_*\` (recursive, `*.log`)<br>`<sysprof>\AppData\Local\Microsoft\CLR_*\` (recursive, `*.log`)<br>`C:\Windows.old\Windows\System32\config\systemprofile\AppData\Local\Microsoft\CLR_*\` (recursive, `*.log`) |
-| OneDrive Metadata | `<user>\AppData\Local\Microsoft\OneDrive\settings\` (recursive)<br>`<user>\AppData\Local\Microsoft\OneDrive\logs\` (recursive: `*.odl*`, `*.aodl`, `*.loggz`, `*.keystore`; not the `.etlgz` traces)<br>`<user>\AppData\Local\Microsoft\SkyDrive\logs\` (recursive; SkyDrive)<br>`<user>\AppData\Local\Microsoft\Windows\OneDrive\logs\` (recursive; Windows 8.1) |
-| PowerShell History | `<user>\AppData\Roaming\Microsoft\Windows\PowerShell\PSReadLine\*_history.txt`<br>`C:\Windows\{System32,SysWOW64}\config\systemprofile\AppData\Roaming\Microsoft\Windows\PowerShell\PSReadLine\*_history.txt` |
-| PowerShell Transcripts | `<user>\Documents\PowerShell_transcript.*.txt` and `<user>\Documents\20*\PowerShell_transcript.*.txt`<br>`<user>\OneDrive*\Documents\PowerShell_transcript.*.txt` and `...\Documents\20*\PowerShell_transcript.*.txt`<br>`C:\Windows\{System32,SysWOW64}\*\PowerShell_transcript.*.txt`<br>`C:\PSTranscript\20*\PowerShell_transcript.*.txt`<br>the policy transcription folder, if on a local drive (recursive) |
+| Application Compatibility | `%SystemRoot%\AppCompat\Programs\Amcache.hve`<br>`%SystemRoot%\appcompat\pca\*` (Windows 11 22H2+)<br>`%SystemRoot%\AppCompat\Programs\RecentFileCache.bcf` (Windows 7)<br>`%SystemDrive%\System Volume Information\Syscache.hve` (Windows 7 / Server 2008 R2)<br>`%SystemDrive%\Windows.old\Windows\AppCompat\Programs\{Amcache.hve,RecentFileCache.bcf}`<br>hives with their `.LOG1`/`.LOG2` |
+| BITS | `%ProgramData%\Microsoft\Network\Downloader\` (recursive) |
+| Defender Logs | `%ProgramData%\Microsoft\Windows Defender\Support\` (recursive)<br>`%ProgramData%\Microsoft\Windows Defender\Scans\History\Service\DetectionHistory\` (recursive)<br>`%ProgramData%\Microsoft\Windows Defender\Scans\History\Service\Detections.log`<br>`%SystemRoot%\Temp\MpCmdRun.log`<br>`%ProgramData%\Microsoft\Microsoft AntiMalware\Support\` (recursive; older Defender / SCEP)<br>`%SystemDrive%\Windows.old\Windows\Temp\MpCmdRun.log` |
+| Event Logs | `%SystemRoot%\System32\winevt\logs\*.evtx`<br>`%SystemRoot%\System32\config\*.evt` (XP)<br>`%SystemDrive%\Windows.old\Windows\System32\winevt\logs\*.evtx` |
+| Firewall Log | `%SystemRoot%\System32\LogFiles\Firewall\pfirewall.*`<br>`%SystemDrive%\Windows.old\Windows\System32\LogFiles\Firewall\pfirewall.*` |
+| Group Policy | `%SystemRoot%\System32\GroupPolicy\` (recursive)<br>`%ProgramData%\Microsoft\Group Policy\History\` (recursive; cached domain GPOs)<br>`%UserProfile%\AppData\Local\Microsoft\Group Policy\History\` (recursive)<br>`%SystemDrive%\Windows.old\Windows\System32\GroupPolicy\` `*.ini`, `*.pol` and `*\Scripts\` (recursive) |
+| Prefetch | `%SystemRoot%\Prefetch\*.pf`<br>`%SystemDrive%\Windows.old\Windows\Prefetch\*.pf` |
+| Registry Hives (system) | `%SystemRoot%\System32\config\{SAM,SECURITY,SOFTWARE,SYSTEM}`<br>`%SystemRoot%\System32\config\RegBack\{SAM,SECURITY,SOFTWARE,SYSTEM,SYSTEM1}`<br>`%SystemDrive%\System Volume Information\_restore*\RP*\snapshot\_REGISTRY_*` (XP restore points)<br>`%SystemDrive%\Windows.old\Windows\System32\config\` and `...\config\RegBack\`, same hives<br>each with its `.LOG1`/`.LOG2` |
+| Restore Point Logs | `%SystemDrive%\System Volume Information\_restore*\RP*\rp.log` (XP) |
+| SCCM Client Logs | `%SystemRoot%\CCM\Logs\*` |
+| Scheduled Tasks | `%SystemRoot%\{System32,SysWOW64}\Tasks\` (recursive)<br>`%UserProfile%\AppData\Local\Microsoft\Windows\PowerShell\ScheduledJobs\` (recursive)<br>`%SystemRoot%\{System32,SysWOW64}\config\systemprofile\AppData\Local\Microsoft\Windows\PowerShell\ScheduledJobs\` (recursive)<br>`%SystemRoot%\Tasks\*.job`, `%SystemRoot%\SchedLgU.txt` (legacy)<br>`%SystemDrive%\Windows.old\Windows\System32\Tasks\` (recursive), `%SystemDrive%\Windows.old\Windows\Tasks\*.job`, `%SystemDrive%\Windows.old\Windows\SchedLgU.txt` |
+| SetupAPI | `%SystemRoot%\INF\setupapi*.log`<br>`%SystemRoot%\setupapi.log` (XP)<br>`%SystemDrive%\Windows.old\Windows\INF\setupapi*.log` |
+| SRUM | `%SystemRoot%\System32\SRU\` (recursive: `SRUDB.dat` and its ESE logs)<br>`%SystemDrive%\Windows.old\Windows\System32\SRU\` (recursive) |
+| User Access Logging (SUM) | `%SystemRoot%\System32\LogFiles\Sum\` (recursive; Windows Server) |
+| Browser History | `%UserProfile%\AppData\Local\Microsoft\Edge{, Beta, Dev, SxS}\User Data\<profile>\History*`<br>`%UserProfile%\AppData\Local\Google\Chrome{, Beta, Dev, SxS}\User Data\<profile>\History*`<br>`%UserProfile%\AppData\Local\Chromium\User Data\<profile>\History*`<br>`%SystemRoot%\System32\config\systemprofile\AppData\Local\` paths for Chrome (all channels) and Chromium<br>`%UserProfile%\AppData\Local\Microsoft\Windows\WebCache\*` (IE 10/11, legacy Edge)<br>`index.dat` under `%UserProfile%\AppData\Local\Microsoft\Windows\{History,IEDownloadHistory}\` (recursive; IE 9 and earlier)<br>XP: `%UserProfile%\Local Settings\Application Data\` paths for Chrome (all channels) and Chromium; `index.dat` under `%UserProfile%\Local Settings\History\History.IE5\` (recursive)<br>The equivalent paths for Brave, Vivaldi, Opera, Yandex, Coc Coc, QQ Browser, 360 Secure Browser, Arc, Wave, Supermium, Prisma Access Browser, Firefox and Safari for Windows, with their legacy and XP forms: the Browser History row of `$artefacts` in [collector.ps1](collector.ps1) |
+| File History Catalogs | `%UserProfile%\AppData\Local\Microsoft\Windows\FileHistory\Configuration\Catalog*.edb` |
+| JumpLists | `%UserProfile%\AppData\Roaming\Microsoft\Windows\Recent\AutomaticDestinations\*.automaticDestinations-ms`<br>`%UserProfile%\AppData\Roaming\Microsoft\Windows\Recent\CustomDestinations\*.customDestinations-ms` |
+| LNK | `%UserProfile%\AppData\Roaming\Microsoft\Windows\Recent\*.lnk`<br>`%UserProfile%\AppData\Roaming\Microsoft\Office\Recent\` (recursive)<br>`%UserProfile%\Desktop\*.lnk`<br>`%UserProfile%\AppData\Roaming\Microsoft\Windows\Start Menu\Programs\*.lnk`<br>`%ProgramData%\Microsoft\Windows\Start Menu\Programs\*.lnk`<br>`%UserProfile%\Recent\` (recursive; XP)<br>`%SystemDrive%\System Volume Information\_restore*\RP*\*.lnk` (XP restore points) |
+| .NET CLR Usage Logs | `%UserProfile%\AppData\Local\Microsoft\CLR_*\` (recursive, `*.log`)<br>`%SystemRoot%\System32\config\systemprofile\AppData\Local\Microsoft\CLR_*\` (recursive, `*.log`)<br>`%SystemDrive%\Windows.old\Windows\System32\config\systemprofile\AppData\Local\Microsoft\CLR_*\` (recursive, `*.log`) |
+| OneDrive Metadata | `%UserProfile%\AppData\Local\Microsoft\OneDrive\settings\` (recursive)<br>`%UserProfile%\AppData\Local\Microsoft\OneDrive\logs\` (recursive: `*.odl*`, `*.aodl`, `*.loggz`, `*.keystore`; not the `.etlgz` traces)<br>`%UserProfile%\AppData\Local\Microsoft\SkyDrive\logs\` (recursive; SkyDrive)<br>`%UserProfile%\AppData\Local\Microsoft\Windows\OneDrive\logs\` (recursive; Windows 8.1) |
+| PowerShell History | `%UserProfile%\AppData\Roaming\Microsoft\Windows\PowerShell\PSReadLine\*_history.txt`<br>`%SystemRoot%\{System32,SysWOW64}\config\systemprofile\AppData\Roaming\Microsoft\Windows\PowerShell\PSReadLine\*_history.txt` |
+| PowerShell Transcripts | `%UserProfile%\Documents\PowerShell_transcript.*.txt` and `%UserProfile%\Documents\20*\PowerShell_transcript.*.txt`<br>`%UserProfile%\OneDrive*\Documents\PowerShell_transcript.*.txt` and `...\Documents\20*\PowerShell_transcript.*.txt`<br>`%SystemRoot%\{System32,SysWOW64}\*\PowerShell_transcript.*.txt`<br>`%SystemDrive%\PSTranscript\20*\PowerShell_transcript.*.txt`<br>the policy transcription folder, if on a local drive (recursive) |
 | Recycle Bin | `<drive>\$Recycle.Bin\<SID>\$I*` on every local drive (FAT/exFAT: `<drive>\$Recycle.Bin\$I*`)<br>`INFO2` under `<drive>\RECYCLE*\` (recursive; XP `RECYCLER`/`RECYCLED`) |
-| Registry Hives (user) | `<user>\NTUSER.DAT`<br>`<user>\AppData\Local\Microsoft\Windows\UsrClass.dat`<br>`C:\Windows\System32\config\DEFAULT` (SYSTEM)<br>`<sysprof>\NTUSER.DAT`<br>`C:\Windows\ServiceProfiles\{LocalService,NetworkService}\NTUSER.DAT`<br>`C:\Windows.old\Windows\`, the same four service-account hives<br>each with its `.LOG1`/`.LOG2` |
-| Startup Folders | `C:\ProgramData\Microsoft\Windows\Start Menu\Programs\StartUp\` (recursive)<br>`<user>\AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Startup\` (recursive) |
-| Teams Logs | `<user>\AppData\Local\Packages\MSTeams_8wekyb3d8bbwe\LocalCache\Microsoft\MSTeams\Logs\*`<br>`<user>\AppData\Local\Packages\MicrosoftTeams_8wekyb3d8bbwe\LocalCache\Microsoft\MSTeams\Logs\*` (Windows 11 built-in Teams)<br>`<user>\AppData\Roaming\Microsoft\Teams\logs.txt` (classic Teams) |
-| WER | `C:\ProgramData\Microsoft\Windows\WER\` (recursive, `*.wer`)<br>`<user>\AppData\Local\Microsoft\Windows\WER\` (recursive, `*.wer`) |
-| Windows Timeline | `ActivitiesCache.db*` under `<user>\AppData\Local\ConnectedDevicesPlatform\` (recursive; Windows 10) |
+| Registry Hives (user) | `%UserProfile%\NTUSER.DAT`<br>`%UserProfile%\AppData\Local\Microsoft\Windows\UsrClass.dat`<br>`%SystemRoot%\System32\config\DEFAULT` (SYSTEM)<br>`%SystemRoot%\System32\config\systemprofile\NTUSER.DAT`<br>`%SystemRoot%\ServiceProfiles\{LocalService,NetworkService}\NTUSER.DAT`<br>`%SystemDrive%\Windows.old\Windows\`, the same four service-account hives<br>each with its `.LOG1`/`.LOG2` |
+| Startup Folders | `%ProgramData%\Microsoft\Windows\Start Menu\Programs\StartUp\` (recursive)<br>`%UserProfile%\AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Startup\` (recursive) |
+| Teams Logs | `%UserProfile%\AppData\Local\Packages\MSTeams_8wekyb3d8bbwe\LocalCache\Microsoft\MSTeams\Logs\*`<br>`%UserProfile%\AppData\Local\Packages\MicrosoftTeams_8wekyb3d8bbwe\LocalCache\Microsoft\MSTeams\Logs\*` (Windows 11 built-in Teams)<br>`%UserProfile%\AppData\Roaming\Microsoft\Teams\logs.txt` (classic Teams) |
+| WER | `%ProgramData%\Microsoft\Windows\WER\` (recursive, `*.wer`)<br>`%UserProfile%\AppData\Local\Microsoft\Windows\WER\` (recursive, `*.wer`) |
+| Windows Timeline | `ActivitiesCache.db*` under `%UserProfile%\AppData\Local\ConnectedDevicesPlatform\` (recursive; Windows 10) |
 
 ## What it can't collect
 
@@ -307,7 +312,7 @@ list (registry transaction logs excepted).
   where Live Response also keeps its script transcripts. If that can't be
   written, it falls back to a `LiveResponseCollector` folder in
   `%SystemDrive%\Windows\SystemTemp\` (newer Windows; SYSTEM and Administrators
-  only), then in the running account's temp folder (`C:\Windows\Temp\` for
+  only), then in the running account's temp folder (`%SystemRoot%\Temp\` for
   SYSTEM). Only the collector's own folder is created; a location whose parent
   folder doesn't exist is skipped. Each run adds a new
   `<HOSTNAME>_<UTC timestamp>Z.zip` (or its volumes) and a `.log` of the same
